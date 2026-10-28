@@ -1,0 +1,10 @@
+# sync.py 运行时产物
+原始数据/
+同步日志/
+vintage_data.zip
+
+# 本机数据库连接配置
+hive_config.py
+
+__pycache__/
+*.pyc
