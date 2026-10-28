@@ -1,0 +1,1 @@
+SELECT * from model.tmp_eliam_risk_000004_strategy_run_log_v3

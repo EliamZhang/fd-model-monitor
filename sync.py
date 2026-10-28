@@ -1,8 +1,8 @@
-"""执行 wagego_04_vintage分析.sql，把各查询块结果写入 原始数据/ 并打包成 vintage_data.zip。
+"""执行 fundo_model_monitor.sql，把各查询块结果写入 原始数据/ 并打包成 model_monitor_data.zip。
 
-SQL 文件按「块 N」注释组织；脚本按分号拆分语句，开头的 SET 作为全局会话设置，
-其余 SELECT 按 QUERY_SPECS 的顺序执行，每个结果写一个 CSV。
-数据库连接由外部 hive_config.query_to_df(sql) 提供，本脚本不负责建连。
+脚本按分号拆分 SQL 语句，开头的 SET 作为全局会话设置，其余 SELECT 按 QUERY_SPECS
+的顺序执行，每个结果写一个 CSV。数据库连接由外部 hive_config.query_to_df(sql) 提供，
+本脚本不负责建连。
 """
 
 import argparse
@@ -24,27 +24,20 @@ if hasattr(sys.stderr, "reconfigure"):
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
-SQL_FILE = PROJECT_DIR / "wagego_04_vintage分析.sql"
+SQL_FILE = PROJECT_DIR / "fundo_model_monitor.sql"
 
 RAW_DIR = PROJECT_DIR / "原始数据"
 LOG_DIR = PROJECT_DIR / "同步日志"
 MANIFEST_FILE = LOG_DIR / "sync_manifest.json"
 FAILED_FILE = LOG_DIR / "failed_tables.csv"
-ZIP_FILE = PROJECT_DIR / "vintage_data.zip"
+ZIP_FILE = PROJECT_DIR / "model_monitor_data.zip"
 
 RAW_DIR_NAME = "原始数据"
 BUSINESS_TZ = timezone(timedelta(hours=8))
 
 # 块号 → 输出文件。顺序必须与 SQL 中 SET 之后的 SELECT 一一对应。
 QUERY_SPECS = (
-    {"id": "1", "file": "vintage_01_fpd_overall", "title": "各窗口成熟样本、坏样本、笔数坏率、金额坏率"},
-    {"id": "2", "file": "vintage_02_fpd15_vs_fpd30", "title": "共同 cohort 上 FPD15 vs FPD30"},
-    {"id": "3", "file": "vintage_03_user_type", "title": "新老客拆分（每个 FPD 窗口 × user_type）"},
-    {"id": "4", "file": "vintage_04_week", "title": "按放款周的 vintage 路径"},
-    {"id": "5a", "file": "vintage_05a_score_coverage", "title": "模型分覆盖（FPD15 成熟样本）"},
-    {"id": "5b", "file": "vintage_05b_score_quintile", "title": "模型分五分位 × 新老客"},
-    {"id": "6", "file": "vintage_06_score_quintile_week", "title": "模型分五分位 × 放款周"},
-    {"id": "7", "file": "vintage_07_application_rank", "title": "老客复借期数（FPD15）"},
+    {"id": "1", "file": "model_monitor_01_strategy_run_log_v3", "title": "策略运行日志 V3 抽样"},
 )
 
 _BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", flags=re.S)
