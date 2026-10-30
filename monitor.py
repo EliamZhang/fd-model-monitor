@@ -8,7 +8,8 @@
     1. 读取 fundo_model_monitor.sql，按分号拆成语句依次执行（DROP / CREATE / 可选 SELECT）
     2. 没有 SELECT 语句时，自动 SELECT * FROM CREATE 出来的每张表
     3. 结果分别写入 原始数据/ 下的 model_monitor_auc.csv、model_monitor_funnel.csv、
-       model_monitor_bin.csv、model_monitor_score_dist.csv，并一起打包成 model_monitor_data.zip
+       model_monitor_bin.csv、model_monitor_score_dist.csv、model_monitor_bin_funnel.csv，
+       并一起打包成 model_monitor_data.zip
     4. 生成根目录下的 model_monitor_dashboard.html（数据内嵌，离线可开）
 """
 
@@ -37,6 +38,7 @@ CSV_FILE = PROJECT_DIR / "原始数据" / "model_monitor_auc.csv"
 FUNNEL_CSV_FILE = PROJECT_DIR / "原始数据" / "model_monitor_funnel.csv"
 BIN_CSV_FILE = PROJECT_DIR / "原始数据" / "model_monitor_bin.csv"
 DIST_CSV_FILE = PROJECT_DIR / "原始数据" / "model_monitor_score_dist.csv"
+BINF_CSV_FILE = PROJECT_DIR / "原始数据" / "model_monitor_bin_funnel.csv"
 ZIP_FILE = PROJECT_DIR / "model_monitor_data.zip"
 HTML_FILE = PROJECT_DIR / "model_monitor_dashboard.html"
 BUSINESS_TZ = timezone(timedelta(hours=8))
@@ -332,6 +334,44 @@ def build_dist_payload(df):
     }
 
 
+def build_binf_payload(df):
+    if df is None or len(df) == 0:
+        return None
+    required = {"time_key", "model_name", "model_bin", "application_cnt",
+                "completed_cnt", "approved_cnt", "deal_cnt"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"分箱转化结果缺少字段：{', '.join(sorted(missing))}")
+
+    df = df.copy()
+    df["time_key"] = df["time_key"].astype(str)
+    df["time_key"] = df["time_key"].map(lambda value: week_start_date(value) or value)
+    df = df[df["time_key"].str.lower() != "nan"]
+    weeks = sorted(df["time_key"].unique(), key=natural_key)
+
+    def integer(row, column):
+        return int(row[column]) if column in row.index and pd.notna(row[column]) else None
+
+    rows = {}
+    for _, row in df.iterrows():
+        rows.setdefault(row["time_key"], {}).setdefault(row["model_name"], {})[
+            str(int(row["model_bin"]))
+        ] = {
+            "apply": integer(row, "application_cnt"),
+            "completed": integer(row, "completed_cnt"),
+            "approved": integer(row, "approved_cnt"),
+            "auto": integer(row, "auto_approved_cnt"),
+            "manual": integer(row, "manual_approved_cnt"),
+            "deal": integer(row, "deal_cnt"),
+        }
+
+    return {
+        "weeks": weeks,
+        "thresholds": {key: limits for key, _, _, limits in MODELS},
+        "rows": rows,
+    }
+
+
 def build_html(payload, source_name):
     payload = {**payload, "source": source_name or ""}
     data = json.dumps(payload, ensure_ascii=False)
@@ -344,6 +384,7 @@ def main(argv=None):
     parser.add_argument("--funnel-csv", help="配合 --from-csv 的转化率结果 CSV；默认取同目录 model_monitor_funnel.csv")
     parser.add_argument("--bin-csv", help="配合 --from-csv 的分箱结果 CSV；默认取同目录 model_monitor_bin.csv")
     parser.add_argument("--dist-csv", help="配合 --from-csv 的分布结果 CSV；默认取同目录 model_monitor_score_dist.csv")
+    parser.add_argument("--bin-funnel-csv", help="配合 --from-csv 的分箱转化结果 CSV；默认取同目录 model_monitor_bin_funnel.csv")
     args = parser.parse_args(argv)
 
     source_table = None
@@ -353,6 +394,7 @@ def main(argv=None):
         funnel_path = Path(args.funnel_csv) if args.funnel_csv else base_dir / FUNNEL_CSV_FILE.name
         bin_path = Path(args.bin_csv) if args.bin_csv else base_dir / BIN_CSV_FILE.name
         dist_path = Path(args.dist_csv) if args.dist_csv else base_dir / DIST_CSV_FILE.name
+        binf_path = Path(args.bin_funnel_csv) if args.bin_funnel_csv else base_dir / BINF_CSV_FILE.name
         funnel_df = load_result(funnel_path) if funnel_path.exists() else None
         if funnel_df is None:
             print(f"未找到转化数据 | {funnel_path}（看板将不显示转化区块）")
@@ -362,6 +404,9 @@ def main(argv=None):
         dist_df = load_result(dist_path) if dist_path.exists() else None
         if dist_df is None:
             print(f"未找到分布数据 | {dist_path}（看板将不显示分布区块）")
+        binf_df = load_result(binf_path) if binf_path.exists() else None
+        if binf_df is None:
+            print(f"未找到分箱转化数据 | {binf_path}（看板将不显示分箱转化区块）")
     else:
         try:
             from hive_config import query_to_df
@@ -373,6 +418,7 @@ def main(argv=None):
         funnel_df, _ = pick_result(results, "funnel", 1)
         bin_df, _ = pick_result(results, "bin", 2)
         dist_df, _ = pick_result(results, "dist", 3)
+        binf_df, _ = pick_result(results, "bin_funnel", 4)
 
     if df is None or len(df) == 0:
         print("警告 | AUC 查询结果为空，看板将显示空状态")
@@ -396,6 +442,10 @@ def main(argv=None):
             dist_df.to_csv(DIST_CSV_FILE, index=False, encoding="utf-8-sig")
             written.append(DIST_CSV_FILE)
             print(f"已保存分布 | {DIST_CSV_FILE}（{len(dist_df)} 行）")
+        if binf_df is not None:
+            binf_df.to_csv(BINF_CSV_FILE, index=False, encoding="utf-8-sig")
+            written.append(BINF_CSV_FILE)
+            print(f"已保存分箱转化 | {BINF_CSV_FILE}（{len(binf_df)} 行）")
         if written:
             write_zip(written)
             print(f"已打包 | {ZIP_FILE}")
@@ -404,6 +454,7 @@ def main(argv=None):
     payload["funnel"] = build_funnel_payload(funnel_df)
     payload["bins"] = build_bin_payload(bin_df)
     payload["dist"] = build_dist_payload(dist_df)
+    payload["binfunnel"] = build_binf_payload(binf_df)
     HTML_FILE.parent.mkdir(parents=True, exist_ok=True)
     HTML_FILE.write_text(build_html(payload, source_table), encoding="utf-8")
     print(f"已生成看板 | {HTML_FILE}")
@@ -414,6 +465,8 @@ def main(argv=None):
         print(f"分箱周数 {len(payload['bins']['weeks'])}")
     if payload["dist"]:
         print(f"分布周数 {len(payload['dist']['weeks'])}")
+    if payload["binfunnel"]:
+        print(f"分箱转化周数 {len(payload['binfunnel']['weeks'])}")
     return 0
 
 
@@ -691,6 +744,32 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <details class="table-view">
       <summary>表格视图</summary>
       <div class="table-scroll" id="dist-table"></div>
+    </details>
+  </section>
+
+  <section class="card" id="binf-card" hidden>
+    <div class="card-head">
+      <h2>分箱转化率（按申请周 · 老客）</h2>
+      <span class="hint">通过率 = 通过/完成；成交率 = 成交/通过；箱 1 最浅 → 箱 5 最深</span>
+    </div>
+    <div class="legend" id="binf-legend"></div>
+    <h3 class="sub-title">通过率</h3>
+    <div class="chart-box">
+      <svg class="chart" id="binf-chart-approval" role="img" tabindex="0"></svg>
+      <div class="empty-state" id="binf-empty-approval" hidden>当前筛选下暂无分箱转化数据</div>
+    </div>
+    <details class="table-view">
+      <summary>通过率表格视图</summary>
+      <div class="table-scroll" id="binf-table-approval"></div>
+    </details>
+    <h3 class="sub-title">成交率</h3>
+    <div class="chart-box">
+      <svg class="chart" id="binf-chart-deal" role="img" tabindex="0"></svg>
+      <div class="empty-state" id="binf-empty-deal" hidden>当前筛选下暂无分箱转化数据</div>
+    </div>
+    <details class="table-view">
+      <summary>成交率表格视图</summary>
+      <div class="table-scroll" id="binf-table-deal"></div>
     </details>
   </section>
 
@@ -1076,13 +1155,14 @@ function clearSvg(svg) {
   while (svg.firstChild) svg.removeChild(svg.firstChild);
 }
 
-function drawYAxis(svg, plot, ticks, formatter, x0) {
-  const axis = cssVar('--axis');
+function drawYAxis(svg, plot, ticks, formatter, colors) {
+  const grid = (colors && colors.grid) || cssVar('--grid');
+  const axis = (colors && colors.axis) || cssVar('--axis');
   ticks.forEach((t) => {
     const y = plot.y(t.value);
     svgEl('line', {
       x1: plot.left, x2: plot.left + plot.width, y1: y, y2: y,
-      stroke: cssVar('--grid'), 'stroke-width': 1,
+      stroke: grid, 'stroke-width': 1,
     }, svg);
     const label = svgEl('text', {
       x: plot.left - 10, y: y + 4, 'text-anchor': 'end',
@@ -1986,7 +2066,7 @@ function renderDistChart() {
   const xOf = (i) => plot.left + (i + 0.5) * band;
 
   const ticks = [0, 0.25, 0.5, 0.75, 1].map((v) => ({ value: v }));
-  drawYAxis(svg, plot, ticks, (v) => Math.round(v * 100) + '%');
+  drawYAxis(svg, plot, ticks, (v) => Math.round(v * 100) + '%', { grid: '#e1e0d9', axis: '#c3c2b7' });
   drawXAxis(svg, plot, weeks, xOf, DIST_H);
 
   weeks.forEach((week, i) => {
@@ -2097,6 +2177,208 @@ function renderDistTable() {
   box.appendChild(table);
 }
 
+function binfCell(week, model, bin) {
+  const byModel = ((DATA.binfunnel && DATA.binfunnel.rows) || {})[week];
+  const bins = byModel ? byModel[model] : undefined;
+  return bins ? bins[String(bin)] : undefined;
+}
+
+function visibleBinfWeeks() {
+  if (!DATA.binfunnel) return [];
+  return state.range === 'all'
+    ? DATA.binfunnel.weeks.slice()
+    : DATA.binfunnel.weeks.slice(-Number(state.range));
+}
+
+function binfRate(cellValue, metric) {
+  if (!cellValue) return null;
+  return metric === 'approval'
+    ? rateOf(cellValue.approved, cellValue.completed)
+    : rateOf(cellValue.deal, cellValue.approved);
+}
+
+function binfSample(cellValue, metric) {
+  if (!cellValue) return null;
+  return metric === 'approval' ? cellValue.completed : cellValue.approved;
+}
+
+function renderBinFunnel() {
+  const card = $('#binf-card');
+  if (!DATA.binfunnel || !DATA.binfunnel.weeks.length) {
+    card.hidden = true;
+    return;
+  }
+  card.hidden = false;
+  const legend = $('#binf-legend');
+  legend.textContent = '';
+  for (let bin = 1; bin <= 5; bin++) {
+    const item = document.createElement('span');
+    item.className = 'item';
+    const key = document.createElement('span');
+    key.className = 'key-line';
+    key.style.borderTopColor = cssVar('--dist-' + bin);
+    item.appendChild(key);
+    item.appendChild(document.createTextNode('箱 ' + bin));
+    legend.appendChild(item);
+  }
+  renderBinFunnelChart('approval');
+  renderBinFunnelChart('deal');
+}
+
+function renderBinFunnelChart(metric) {
+  const svg = $('#binf-chart-' + metric);
+  const empty = $('#binf-empty-' + metric);
+  clearSvg(svg);
+  const weeks = visibleBinfWeeks();
+  const model = state.binModel;
+  const modelMeta = buildPayloadMaps().find((item) => item.key === model);
+  const modelName = modelMeta ? modelMeta.display : (model || '');
+
+  const series = [];
+  for (let bin = 1; bin <= 5; bin++) {
+    series.push({
+      bin,
+      color: cssVar('--dist-' + bin),
+      points: weeks.map((week, i) => {
+        const cellValue = binfCell(week, model, bin);
+        const rate = binfRate(cellValue, metric);
+        if (rate === null) return null;
+        return { i, v: rate, n: binfSample(cellValue, metric) };
+      }),
+    });
+  }
+  const values = [];
+  series.forEach((item) => item.points.forEach((point) => { if (point) values.push(point.v); }));
+  if (!weeks.length || !values.length) {
+    svg.style.display = 'none';
+    empty.hidden = false;
+    renderBinFunnelTable(metric, weeks, model);
+    return;
+  }
+  svg.style.display = 'block';
+  empty.hidden = true;
+
+  const BF_H = 280;
+  const plot = { left: M.left, top: M.top, width: SVG_W - M.left - M.right, height: BF_H - M.top - M.bottom };
+  plot.y = (v) => plot.top + (1 - v) * plot.height;
+  svg.setAttribute('viewBox', `0 0 ${SVG_W} ${BF_H}`);
+
+  const plate = '#fcfcfb';
+  svgEl('rect', {
+    x: plot.left, y: plot.top, width: plot.width, height: plot.height,
+    fill: plate, rx: 3,
+  }, svg);
+
+  const xOf = (i) => plot.left + (i + 0.5) * plot.width / weeks.length;
+  const ticks = [0, 0.25, 0.5, 0.75, 1].map((v) => ({ value: v }));
+  drawYAxis(svg, plot, ticks, (v) => Math.round(v * 100) + '%', { grid: '#e1e0d9', axis: '#c3c2b7' });
+  drawXAxis(svg, plot, weeks, xOf, BF_H);
+
+  series.forEach((item) => {
+    let d = '';
+    let open = false;
+    item.points.forEach((point) => {
+      if (!point) { open = false; return; }
+      d += (open ? 'L' : 'M') + xOf(point.i) + ',' + plot.y(point.v) + ' ';
+      open = true;
+    });
+    if (d) {
+      svgEl('path', {
+        d, fill: 'none', stroke: item.color, 'stroke-width': 2,
+        'stroke-linejoin': 'round', 'stroke-linecap': 'round',
+      }, svg);
+    }
+  });
+
+  series.forEach((item) => {
+    const last = item.points.filter(Boolean).pop();
+    if (!last) return;
+    svgEl('circle', {
+      cx: xOf(last.i), cy: plot.y(last.v), r: 4, fill: item.color,
+      stroke: plate, 'stroke-width': 2,
+    }, svg);
+  });
+
+  const crosshair = svgEl('line', {
+    y1: plot.top, y2: plot.top + plot.height, stroke: '#c3c2b7',
+    'stroke-width': 1, visibility: 'hidden',
+  }, svg);
+
+  attachCrosshair(svg, SVG_W, plot.left, plot.width, weeks, {
+    show(index, clientX, clientY) {
+      const x = xOf(index);
+      crosshair.setAttribute('x1', x);
+      crosshair.setAttribute('x2', x);
+      crosshair.setAttribute('visibility', 'visible');
+      showTooltip((tip) => {
+        const head = document.createElement('div');
+        head.className = 'tt-week';
+        head.textContent = weeks[index] + (modelName ? ' · ' + modelName : '');
+        tip.appendChild(head);
+        series.forEach((item) => {
+          const point = item.points[index];
+          const interval = binIntervalText(model, item.bin);
+          const name = '箱 ' + item.bin + (interval ? ' (' + interval + ')' : '');
+          addTooltipRow(tip, item.color, name,
+            point ? (point.v * 100).toFixed(1) + '% · n ' + fmtInt.format(point.n || 0) : '—');
+        });
+      }, clientX, clientY);
+    },
+    showAt(index) {
+      const rect = svg.getBoundingClientRect();
+      const scale = rect.width / SVG_W;
+      return { x: rect.left + xOf(index) * scale, y: rect.top + plot.top + plot.height / 2 };
+    },
+    hide() {
+      crosshair.setAttribute('visibility', 'hidden');
+      hideTooltip();
+    },
+  });
+
+  renderBinFunnelTable(metric, weeks, model);
+}
+
+function renderBinFunnelTable(metric, weeks, model) {
+  const box = $('#binf-table-' + metric);
+  box.textContent = '';
+  if (!DATA.binfunnel) return;
+  const table = document.createElement('table');
+  const thead = document.createElement('thead');
+  const headRow = document.createElement('tr');
+  ['周', '申请量'].concat([1, 2, 3, 4, 5].map((bin) => '箱 ' + bin)).forEach((text) => {
+    const th = document.createElement('th');
+    th.textContent = text;
+    headRow.appendChild(th);
+  });
+  thead.appendChild(headRow);
+  table.appendChild(thead);
+
+  const tbody = document.createElement('tbody');
+  weeks.slice().reverse().forEach((week) => {
+    const tr = document.createElement('tr');
+    let applyTotal = 0;
+    const cells = [week];
+    const rates = [];
+    for (let bin = 1; bin <= 5; bin++) {
+      const cellValue = binfCell(week, model, bin);
+      if (cellValue && cellValue.apply) applyTotal += cellValue.apply;
+      const rate = binfRate(cellValue, metric);
+      const n = binfSample(cellValue, metric);
+      rates.push(rate === null ? '—' : (rate * 100).toFixed(1) + '% (' + fmtInt.format(n || 0) + ')');
+    }
+    cells.push(applyTotal ? fmtInt.format(applyTotal) : '—');
+    rates.forEach((text) => cells.push(text));
+    cells.forEach((text) => {
+      const td = document.createElement('td');
+      td.textContent = text;
+      tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  box.appendChild(table);
+}
+
 function renderAll() {
   $('#meta-source').textContent = DATA.source ? '数据表 ' + DATA.source : '';
   $('#meta-generated').textContent = '生成于 ' + DATA.generatedAt;
@@ -2110,6 +2392,7 @@ function renderAll() {
   renderBinModelOptions();
   renderBins();
   renderDist();
+  renderBinFunnel();
 }
 
 $('#range-select').addEventListener('change', (event) => {
@@ -2121,6 +2404,7 @@ $('#bin-model-select').addEventListener('change', (event) => {
   state.binModel = event.target.value;
   renderBins();
   renderDist();
+  renderBinFunnel();
 });
 
 renderPills();
