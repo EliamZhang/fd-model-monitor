@@ -16,7 +16,7 @@ import json
 import re
 import sys
 import zipfile
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -57,10 +57,24 @@ MODELS = [
 ]
 
 _UNFUNDED = "UNFUNDED"
+# 已表现样本量低于历史常规水平的这个比例时，视为「样本未成熟」
+MATURITY_THRESHOLD = 0.75
 _NATURAL_RE = re.compile(r"(\d+)")
+_WEEK_RE = re.compile(r"^(\d{4})-?W(\d{2})$", re.I)
 _CREATE_RE = re.compile(
     r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z0-9_.]+)", re.I
 )
+
+
+def week_start_date(text):
+    """把 2026W42 这类 ISO 周标记换算成该周周一的日期字符串。"""
+    match = _WEEK_RE.match(str(text).strip())
+    if not match:
+        return None
+    try:
+        return date.fromisocalendar(int(match.group(1)), int(match.group(2)), 1).isoformat()
+    except ValueError:
+        return None
 
 
 def now():
@@ -130,6 +144,7 @@ def build_payload(df):
     df = df.copy()
     df["time_key"] = df["time_key"].astype(str)
     df = df[df["time_key"].str.upper() != _UNFUNDED]
+    df["time_key"] = df["time_key"].map(lambda value: week_start_date(value) or value)
 
     weeks = sorted(df["time_key"].unique(), key=natural_key)
     label_keys = [key for key, _ in LABELS]
@@ -159,6 +174,22 @@ def build_payload(df):
             "neg": count(point["neg_cnt"]),
         }
 
+    # 成熟度 = 本周已表现样本 / 该标签历史常规表现量（最近 8 周不参与基准）
+    counts = df.groupby(["label_name", "time_key"])["performance_cnt"].first()
+    maturity = {}
+    for label in df["label_name"].unique():
+        series = counts.loc[label].reindex(weeks)
+        valid = series.dropna()
+        if valid.empty:
+            continue
+        baseline = valid.iloc[:-8].median() if len(valid) > 8 else valid.median()
+        if pd.isna(baseline) or baseline <= 0:
+            continue
+        maturity[label] = {
+            week: None if pd.isna(value) else round(min(float(value) / float(baseline), 1.0), 2)
+            for week, value in series.items()
+        }
+
     return {
         "generatedAt": now().isoformat(timespec="seconds"),
         "labels": [{"key": key, "name": dict(LABELS).get(key, key)} for key in labels],
@@ -172,6 +203,8 @@ def build_payload(df):
         ],
         "weeks": weeks,
         "rows": rows,
+        "maturity": maturity,
+        "maturityThreshold": MATURITY_THRESHOLD,
     }
 
 
@@ -238,6 +271,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     --good: #006300;
     --bad: #d03b3b;
     --wash: rgba(11, 11, 11, 0.04);
+    --band: rgba(137, 135, 129, 0.16);
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -256,6 +290,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       --good: #0ca30c;
       --bad: #e66767;
       --wash: rgba(255, 255, 255, 0.05);
+      --band: rgba(137, 135, 129, 0.16);
     }
   }
   * { box-sizing: border-box; }
@@ -340,6 +375,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   details.table-view summary::before { content: "▸"; color: var(--muted); transition: transform 0.15s; }
   details.table-view[open] summary::before { transform: rotate(90deg); }
   .table-scroll { overflow-x: auto; padding-bottom: 10px; }
+  .table-note { color: var(--muted); font-size: 11.5px; margin: 0 0 10px; }
   table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
   th, td { text-align: right; padding: 6px 10px; white-space: nowrap; }
   th { color: var(--muted); font-weight: 500; border-bottom: 1px solid var(--grid); }
@@ -357,7 +393,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="meta">
       <span id="meta-source"></span>
       <span id="meta-generated"></span>
-      <span>周 = 放款周（dispersal_week），每申请取最新一次 run</span>
+      <span>周 = 放款周（dispersal_week，图中显示为该周周一日期），每申请取最新一次 run</span>
     </div>
   </header>
 
@@ -379,7 +415,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <section class="card">
     <div class="card-head">
       <h2>周度 AUC</h2>
-      <span class="hint">越高越好；样本未成熟的周 AUC 为空</span>
+      <span class="hint">越高越好；阴影区 = 样本未成熟（已表现低于常规 75%），波动仅供参考</span>
     </div>
     <div class="legend" id="auc-legend"></div>
     <div class="chart-box">
@@ -395,7 +431,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <section class="card">
     <div class="card-head">
       <h2>周度样本量</h2>
-      <span class="hint">已表现样本 = 标签已成熟的申请；悬停查看好/坏拆分</span>
+      <span class="hint">已表现样本 = 标签已成熟的申请；浅色柱 = 样本未成熟</span>
     </div>
     <div class="chart-box">
       <svg class="chart" id="count-chart" role="img" tabindex="0"></svg>
@@ -439,6 +475,20 @@ function svgEl(tag, attrs = {}, parent) {
 function cell(label, week, model) {
   const byWeek = (DATA.rows[label] || {})[week];
   return byWeek ? byWeek[model] : undefined;
+}
+
+function maturityOf(label, week) {
+  const value = (DATA.maturity[label] || {})[week];
+  return value === undefined ? null : value;
+}
+
+function isImmature(label, week) {
+  const value = maturityOf(label, week);
+  return value !== null && value < DATA.maturityThreshold;
+}
+
+function barOpacity(week) {
+  return isImmature(state.label, week) ? 0.35 : 0.85;
 }
 
 function visibleWeeks() {
@@ -587,18 +637,19 @@ function renderKpis(weeks) {
     }
     const row = cell(state.label, latest.week, mainModel.key);
     const perf = row && row.perf != null ? row.perf : 0;
-    const subBase = `已表现 ${fmtInt.format(perf)} · ${latest.week}`;
+    const mature = !isImmature(state.label, latest.week);
+    const subBase = (mature ? '' : '样本未成熟 · ') + `已表现 ${fmtInt.format(perf)} · ${latest.week}`;
     let delta = null;
     let sub = subBase;
     if (state.version === 'compare' && family.v11 && mainModel.key !== family.v11.key) {
       const other = cell(state.label, latest.week, family.v11.key);
       if (other && other.auc != null) {
-        delta = latest.value - other.auc;
+        if (mature) delta = latest.value - other.auc;
         sub = `1.1 ${fmtAuc(other.auc)} · ${subBase}`;
       }
-    } else {
+    } else if (mature) {
       const prev = previousPoint(state.label, weeks, mainModel.key, 'auc', latest.index);
-      delta = prev ? latest.value - prev.value : null;
+      if (prev && !isImmature(state.label, prev.week)) delta = latest.value - prev.value;
     }
     return {
       name: state.version === 'compare' ? family.name : family.name + ' ' + mainModel.version,
@@ -840,6 +891,16 @@ function renderAucChart(weeks) {
   drawYAxis(svg, plot, ticks, (v) => v === 0 ? '0' : v.toFixed(1));
   drawXAxis(svg, plot, weeks, xOf, AUC_H);
 
+  // 样本未成熟周打底纹，提示该段 AUC 波动不可靠
+  const bandWidth = plot.width / weeks.length;
+  weeks.forEach((week, i) => {
+    if (!isImmature(state.label, week)) return;
+    svgEl('rect', {
+      x: plot.left + i * bandWidth, y: plot.top,
+      width: bandWidth, height: plot.height, fill: cssVar('--band'),
+    }, svg);
+  });
+
   const series = models.map((model) => {
     const points = weeks.map((week, i) => {
       const c = cell(state.label, week, model.key);
@@ -915,6 +976,10 @@ function renderAucChart(weeks) {
           if (c && c.perf !== undefined && c.perf !== null) perf = c.perf;
         });
         if (perf !== null) addTooltipRow(tip, null, '已表现样本', fmtInt.format(perf));
+        const mat = maturityOf(state.label, weeks[index]);
+        if (mat !== null) {
+          addTooltipRow(tip, null, '成熟度', Math.round(mat * 100) + '%' + (mat < DATA.maturityThreshold ? '（未成熟）' : ''));
+        }
       }, clientX, clientY);
     },
     showAt(index) {
@@ -976,7 +1041,7 @@ function renderCountChart(weeks) {
     const r = Math.min(4, h, barW / 2);
     const d = `M${x},${y + h} L${x},${y + r} Q${x},${y} ${x + r},${y} L${x + barW - r},${y} Q${x + barW},${y} ${x + barW},${y + r} L${x + barW},${y + h} Z`;
     const bar = svgEl('path', {
-      d, fill: cssVar('--series-1'), 'fill-opacity': 0.85,
+      d, fill: cssVar('--series-1'), 'fill-opacity': barOpacity(week),
     }, svg);
     bars.push({ week, value, node: bar });
   });
@@ -988,7 +1053,7 @@ function renderCountChart(weeks) {
 
   attachCrosshair(svg, SVG_W, plot.left, plot.width, weeks, {
     show(index, clientX, clientY) {
-      bars.forEach((b) => b.node.setAttribute('fill-opacity', 0.85));
+      bars.forEach((b) => b.node.setAttribute('fill-opacity', barOpacity(b.week)));
       const mine = bars.find((b) => b.week === weeks[index]);
       if (mine) mine.node.setAttribute('fill-opacity', 1);
       const x = xOf(index);
@@ -1025,7 +1090,7 @@ function renderCountChart(weeks) {
       };
     },
     hide() {
-      bars.forEach((b) => b.node.setAttribute('fill-opacity', 0.85));
+      bars.forEach((b) => b.node.setAttribute('fill-opacity', barOpacity(b.week)));
       crosshair.setAttribute('visibility', 'hidden');
       hideTooltip();
     },
@@ -1042,7 +1107,7 @@ function renderTable(weeks) {
   const headRow = document.createElement('tr');
   ['周'].forEach((t) => { const th = document.createElement('th'); th.textContent = t; headRow.appendChild(th); });
   models.forEach((model) => { const th = document.createElement('th'); th.textContent = model.display; headRow.appendChild(th); });
-  ['已表现', '坏样本', '坏率'].forEach((t) => { const th = document.createElement('th'); th.textContent = t; headRow.appendChild(th); });
+  ['已表现', '成熟度', '坏样本', '坏率'].forEach((t) => { const th = document.createElement('th'); th.textContent = t; headRow.appendChild(th); });
   thead.appendChild(headRow);
   table.appendChild(thead);
 
@@ -1066,6 +1131,12 @@ function renderTable(weeks) {
     const tdPerf = document.createElement('td');
     tdPerf.textContent = perf === null ? '—' : fmtInt.format(perf);
     tr.appendChild(tdPerf);
+    const mat = maturityOf(state.label, week);
+    const tdMat = document.createElement('td');
+    tdMat.textContent = mat === null
+      ? '—'
+      : Math.round(mat * 100) + '%' + (mat < DATA.maturityThreshold ? '*' : '');
+    tr.appendChild(tdMat);
     const tdPos = document.createElement('td');
     tdPos.textContent = pos === null ? '—' : fmtInt.format(pos);
     tr.appendChild(tdPos);
@@ -1076,6 +1147,13 @@ function renderTable(weeks) {
   });
   table.appendChild(tbody);
   box.appendChild(table);
+  if (weeks.some((week) => isImmature(state.label, week))) {
+    const note = document.createElement('p');
+    note.className = 'table-note';
+    note.textContent = '* 样本未成熟（已表现低于常规水平的 '
+      + Math.round(DATA.maturityThreshold * 100) + '%），AUC 波动较大，仅供参考';
+    box.appendChild(note);
+  }
 }
 
 function renderAll() {
