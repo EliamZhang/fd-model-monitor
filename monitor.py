@@ -46,13 +46,14 @@ LABELS = [
 ]
 
 # (模型分字段, 展示用家族名, 版本)。版本用于 1.1 / 1.2 对比切换。
+# mltmodel = 融合主模型；submodel = 银行流水子模型；appmodel = 行为子模型。
 MODELS = [
-    ("old_risk_bid_submodel_250909_txn", "submodel 交易", "1.1"),
-    ("aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score", "submodel 交易", "1.2"),
-    ("old_risk_bid_mltmodel_v1_1_20251021", "mltmodel 多期", "1.1"),
-    ("old_risk_bid_mltmodel_v1_2_20260325", "mltmodel 多期", "1.2"),
-    ("old_risk_bid_appmodel_v1_1_20250911", "appmodel 申请", "1.1"),
-    ("aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score", "appmodel 申请", "1.2"),
+    ("old_risk_bid_submodel_250909_txn", "submodel 银行流水子模型", "1.1"),
+    ("aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score", "submodel 银行流水子模型", "1.2"),
+    ("old_risk_bid_mltmodel_v1_1_20251021", "mltmodel 融合主模型", "1.1"),
+    ("old_risk_bid_mltmodel_v1_2_20260325", "mltmodel 融合主模型", "1.2"),
+    ("old_risk_bid_appmodel_v1_1_20250911", "appmodel 行为子模型", "1.1"),
+    ("aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score", "appmodel 行为子模型", "1.2"),
 ]
 
 _UNFUNDED = "UNFUNDED"
@@ -219,7 +220,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>老客模型周度监控（1.1 / 1.2）</title>
+<title>Fundo 老客模型监控</title>
 <style>
   :root {
     color-scheme: light;
@@ -352,7 +353,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <body>
 <div class="wrap">
   <header>
-    <h1>老客模型周度监控（1.1 / 1.2）</h1>
+    <h1>Fundo 老客模型监控</h1>
     <div class="meta">
       <span id="meta-source"></span>
       <span id="meta-generated"></span>
@@ -403,6 +404,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   </section>
 
   <p class="note">
+    模型说明：mltmodel = 融合主模型，submodel = 银行流水子模型，appmodel = 行为子模型。
     口径说明：标签取自 ba.customer_profile_rawdata（FPD7）与 model.tmp_eliam_listing_vintage（首期/2 期/3 期），
     未放款申请不参与 AUC；最近一周的 FPD7、近 1-3 个月的 30+ 标签尚未成熟，样本量会明显偏低属正常现象。
     v1.2 于 2026-09-23 上线，此前周的 v1.2 分为离线回填（回测口径）；submodel v1.2 在 2026Q1 前覆盖约 68%-81%。
@@ -517,8 +519,11 @@ function shortWeek(week) {
 }
 
 function yearMonth(week) {
-  const m = /^(\d{4})-(\d{2})/.exec(week);
-  return m ? m[1].slice(2) + '-' + m[2] : week;
+  let m = /^(\d{4})-(\d{2})/.exec(week);
+  if (m) return m[1].slice(2) + '-' + m[2];
+  m = /^(\d{4})-?W(\d{2})$/i.exec(week);
+  if (m) return m[1].slice(2) + '-W' + m[2];
+  return week;
 }
 
 function tickIndices(n, count) {
@@ -821,15 +826,8 @@ function renderAucChart(weeks) {
   svg.style.display = 'block';
   empty.hidden = true;
 
-  const dataMin = Math.min(...values);
-  const dataMax = Math.max(...values);
-  let yMin = Math.max(0.5, dataMin - 0.02);
-  let yMax = Math.min(1.0, dataMax + 0.02);
-  if (yMax - yMin < 0.05) {
-    const mid = (yMax + yMin) / 2;
-    yMin = Math.max(0.5, mid - 0.025);
-    yMax = Math.min(1.0, mid + 0.025);
-  }
+  const yMin = 0;
+  const yMax = 1;
 
   const plot = { left: M.left, top: M.top, width: SVG_W - M.left - M.right, height: AUC_H - M.top - M.bottom };
   plot.y = (v) => plot.top + (yMax - v) / (yMax - yMin) * plot.height;
@@ -839,7 +837,7 @@ function renderAucChart(weeks) {
   const start = Math.ceil(yMin / step) * step;
   const ticks = [];
   for (let v = start; v <= yMax + 1e-9; v += step) ticks.push({ value: Number(v.toFixed(4)) });
-  drawYAxis(svg, plot, ticks, (v) => v.toFixed(2));
+  drawYAxis(svg, plot, ticks, (v) => v === 0 ? '0' : v.toFixed(1));
   drawXAxis(svg, plot, weeks, xOf, AUC_H);
 
   const series = models.map((model) => {

@@ -5,8 +5,8 @@
 --   * 周口径：放款周 cp.dispersal_week，未放款归入 UNFUNDED
 -- 标签：FPD7 + 首期 5+/30+、2 期 30+、3 期 30+
 -- 监控分（5 标签 × 6 分 = STACK 30 行）：
---   v1.1：submodel / mltmodel / appmodel
---   v1.2：submodel / mltmodel / appmodel
+--   mltmodel（融合主模型）/ submodel（银行流水子模型）/ appmodel（行为子模型）
+--   v1.1 与 v1.2 各一套
 -- =====================================================================
 
 DROP TABLE IF EXISTS model.tmp_eliam_risk_000004_strategy_weekly_auc;
