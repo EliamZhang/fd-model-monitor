@@ -420,11 +420,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       --series-1: #3987e5;
       --series-2: #d95926;
       --series-3: #199e70;
-      --seq-0: #5f1919;
-      --seq-1: #9c2626;
-      --seq-2: #d13c3c;
-      --seq-3: #ec7a7a;
-      --seq-4: #f7bcbc;
+      --seq-0: #fce8e8;
+      --seq-1: #f5b5b5;
+      --seq-2: #e87676;
+      --seq-3: #cf3b3b;
+      --seq-4: #8e1d1d;
       --good: #0ca30c;
       --bad: #e66767;
       --wash: rgba(255, 255, 255, 0.05);
@@ -1693,6 +1693,12 @@ function renderBinHeatmap(label, suffix) {
   const height = plot.top + 5 * cellH + 30;
   svg.setAttribute('viewBox', `0 0 ${SVG_W} ${height}`);
 
+  // 热力图统一用浅色底版，保证「风险越高颜色越深」在明暗主题下都成立
+  svgEl('rect', {
+    x: plot.left, y: plot.top, width: plot.width, height: 5 * cellH,
+    fill: '#fcfcfb', rx: 3,
+  }, svg);
+
   const xOf = (i) => plot.left + (i + 0.5) * cellW;
 
   for (let bin = 1; bin <= 5; bin++) {
@@ -1706,7 +1712,7 @@ function renderBinHeatmap(label, suffix) {
   drawXAxis(svg, plot, weeks, xOf, height);
 
   const outline = svgEl('rect', {
-    fill: 'none', stroke: cssVar('--ink'), 'stroke-width': 2, visibility: 'hidden',
+    fill: 'none', stroke: '#0b0b0b', 'stroke-width': 2, visibility: 'hidden',
     'pointer-events': 'none',
   }, svg);
 
