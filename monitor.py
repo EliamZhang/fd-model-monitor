@@ -7,7 +7,7 @@
 流程：
     1. 读取 fundo_model_monitor.sql，按分号拆成语句依次执行（DROP / CREATE / 可选 SELECT）
     2. 没有 SELECT 语句时，自动 SELECT * FROM CREATE 出来的表
-    3. 结果写入 原始数据/model_monitor_auc.csv
+    3. 结果写入 原始数据/model_monitor_auc.csv，并打包成 model_monitor_data.zip
     4. 生成 看板/model_monitor_dashboard.html（数据内嵌，离线可开）
 """
 
@@ -15,6 +15,7 @@ import argparse
 import json
 import re
 import sys
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -32,6 +33,7 @@ if hasattr(sys.stderr, "reconfigure"):
 PROJECT_DIR = Path(__file__).resolve().parent
 SQL_FILE = PROJECT_DIR / "fundo_model_monitor.sql"
 CSV_FILE = PROJECT_DIR / "原始数据" / "model_monitor_auc.csv"
+ZIP_FILE = PROJECT_DIR / "model_monitor_data.zip"
 HTML_FILE = PROJECT_DIR / "看板" / "model_monitor_dashboard.html"
 BUSINESS_TZ = timezone(timedelta(hours=8))
 
@@ -100,6 +102,15 @@ def run_sql_file(query_fn):
 def load_result(path):
     print(f"读取本地结果 | {path}")
     return pd.read_csv(path, encoding="utf-8-sig")
+
+
+def write_zip(csv_path):
+    """把结果 CSV 按 原始数据/ 目录结构打包，方便整包拉回本地。"""
+    temporary = ZIP_FILE.with_suffix(".zip.tmp")
+    with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("原始数据/", "")
+        archive.write(csv_path, f"原始数据/{csv_path.name}")
+    temporary.replace(ZIP_FILE)
 
 
 def build_payload(df):
@@ -179,7 +190,9 @@ def main(argv=None):
     if not args.from_csv:
         CSV_FILE.parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(CSV_FILE, index=False, encoding="utf-8-sig")
+        write_zip(CSV_FILE)
         print(f"已保存结果 | {CSV_FILE}（{len(df)} 行）")
+        print(f"已打包 | {ZIP_FILE}")
 
     payload = build_payload(df)
     HTML_FILE.parent.mkdir(parents=True, exist_ok=True)
