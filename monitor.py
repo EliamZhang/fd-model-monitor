@@ -7,8 +7,8 @@
 流程：
     1. 读取 fundo_model_monitor.sql，按分号拆成语句依次执行（DROP / CREATE / 可选 SELECT）
     2. 没有 SELECT 语句时，自动 SELECT * FROM CREATE 出来的每张表
-    3. 结果分别写入 原始数据/model_monitor_auc.csv、model_monitor_funnel.csv、model_monitor_bin.csv，
-       并一起打包成 model_monitor_data.zip
+    3. 结果分别写入 原始数据/ 下的 model_monitor_auc.csv、model_monitor_funnel.csv、
+       model_monitor_bin.csv、model_monitor_score_dist.csv，并一起打包成 model_monitor_data.zip
     4. 生成根目录下的 model_monitor_dashboard.html（数据内嵌，离线可开）
 """
 
@@ -36,6 +36,7 @@ SQL_FILE = PROJECT_DIR / "fundo_model_monitor.sql"
 CSV_FILE = PROJECT_DIR / "原始数据" / "model_monitor_auc.csv"
 FUNNEL_CSV_FILE = PROJECT_DIR / "原始数据" / "model_monitor_funnel.csv"
 BIN_CSV_FILE = PROJECT_DIR / "原始数据" / "model_monitor_bin.csv"
+DIST_CSV_FILE = PROJECT_DIR / "原始数据" / "model_monitor_score_dist.csv"
 ZIP_FILE = PROJECT_DIR / "model_monitor_data.zip"
 HTML_FILE = PROJECT_DIR / "model_monitor_dashboard.html"
 BUSINESS_TZ = timezone(timedelta(hours=8))
@@ -304,6 +305,33 @@ def build_bin_payload(df):
     }
 
 
+def build_dist_payload(df):
+    if df is None or len(df) == 0:
+        return None
+    required = {"time_key", "model_name", "model_bin", "application_cnt"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"分布结果缺少字段：{', '.join(sorted(missing))}")
+
+    df = df.copy()
+    df["time_key"] = df["time_key"].astype(str)
+    df["time_key"] = df["time_key"].map(lambda value: week_start_date(value) or value)
+    df = df[df["time_key"].str.lower() != "nan"]
+    weeks = sorted(df["time_key"].unique(), key=natural_key)
+
+    rows = {}
+    for _, row in df.iterrows():
+        rows.setdefault(row["time_key"], {}).setdefault(row["model_name"], {})[
+            str(int(row["model_bin"]))
+        ] = int(row["application_cnt"])
+
+    return {
+        "weeks": weeks,
+        "thresholds": {key: limits for key, _, _, limits in MODELS},
+        "rows": rows,
+    }
+
+
 def build_html(payload, source_name):
     payload = {**payload, "source": source_name or ""}
     data = json.dumps(payload, ensure_ascii=False)
@@ -315,6 +343,7 @@ def main(argv=None):
     parser.add_argument("--from-csv", help="不连库，直接用已导出的 AUC 结果 CSV 生成看板")
     parser.add_argument("--funnel-csv", help="配合 --from-csv 的转化率结果 CSV；默认取同目录 model_monitor_funnel.csv")
     parser.add_argument("--bin-csv", help="配合 --from-csv 的分箱结果 CSV；默认取同目录 model_monitor_bin.csv")
+    parser.add_argument("--dist-csv", help="配合 --from-csv 的分布结果 CSV；默认取同目录 model_monitor_score_dist.csv")
     args = parser.parse_args(argv)
 
     source_table = None
@@ -323,12 +352,16 @@ def main(argv=None):
         base_dir = Path(args.from_csv).parent
         funnel_path = Path(args.funnel_csv) if args.funnel_csv else base_dir / FUNNEL_CSV_FILE.name
         bin_path = Path(args.bin_csv) if args.bin_csv else base_dir / BIN_CSV_FILE.name
+        dist_path = Path(args.dist_csv) if args.dist_csv else base_dir / DIST_CSV_FILE.name
         funnel_df = load_result(funnel_path) if funnel_path.exists() else None
         if funnel_df is None:
             print(f"未找到转化数据 | {funnel_path}（看板将不显示转化区块）")
         bin_df = load_result(bin_path) if bin_path.exists() else None
         if bin_df is None:
             print(f"未找到分箱数据 | {bin_path}（看板将不显示分箱区块）")
+        dist_df = load_result(dist_path) if dist_path.exists() else None
+        if dist_df is None:
+            print(f"未找到分布数据 | {dist_path}（看板将不显示分布区块）")
     else:
         try:
             from hive_config import query_to_df
@@ -339,6 +372,7 @@ def main(argv=None):
         df, source_table = pick_result(results, "auc", 0)
         funnel_df, _ = pick_result(results, "funnel", 1)
         bin_df, _ = pick_result(results, "bin", 2)
+        dist_df, _ = pick_result(results, "dist", 3)
 
     if df is None or len(df) == 0:
         print("警告 | AUC 查询结果为空，看板将显示空状态")
@@ -358,6 +392,10 @@ def main(argv=None):
             bin_df.to_csv(BIN_CSV_FILE, index=False, encoding="utf-8-sig")
             written.append(BIN_CSV_FILE)
             print(f"已保存分箱 | {BIN_CSV_FILE}（{len(bin_df)} 行）")
+        if dist_df is not None:
+            dist_df.to_csv(DIST_CSV_FILE, index=False, encoding="utf-8-sig")
+            written.append(DIST_CSV_FILE)
+            print(f"已保存分布 | {DIST_CSV_FILE}（{len(dist_df)} 行）")
         if written:
             write_zip(written)
             print(f"已打包 | {ZIP_FILE}")
@@ -365,6 +403,7 @@ def main(argv=None):
     payload = build_payload(df)
     payload["funnel"] = build_funnel_payload(funnel_df)
     payload["bins"] = build_bin_payload(bin_df)
+    payload["dist"] = build_dist_payload(dist_df)
     HTML_FILE.parent.mkdir(parents=True, exist_ok=True)
     HTML_FILE.write_text(build_html(payload, source_table), encoding="utf-8")
     print(f"已生成看板 | {HTML_FILE}")
@@ -373,6 +412,8 @@ def main(argv=None):
         print(f"转化周数 {len(payload['funnel']['weeks'])}")
     if payload["bins"]:
         print(f"分箱周数 {len(payload['bins']['weeks'])}")
+    if payload["dist"]:
+        print(f"分布周数 {len(payload['dist']['weeks'])}")
     return 0
 
 
@@ -401,6 +442,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     --seq-2: #e87676;
     --seq-3: #cf3b3b;
     --seq-4: #8e1d1d;
+    --dist-1: #e29b9b;
+    --dist-2: #d67474;
+    --dist-3: #c34e4e;
+    --dist-4: #a92d2d;
+    --dist-5: #871919;
     --good: #006300;
     --bad: #d03b3b;
     --wash: rgba(11, 11, 11, 0.04);
@@ -488,6 +534,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .sub-title { font-size: 13px; font-weight: 600; margin: 14px 0 2px; color: var(--ink-2); }
   .legend { display: flex; flex-wrap: wrap; gap: 14px; margin: 8px 0 2px; color: var(--ink-2); font-size: 12.5px; }
   .legend .item { display: inline-flex; align-items: center; gap: 6px; }
+  .swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; flex: none; }
   .key-line { width: 16px; border-top: 2px solid; border-radius: 1px; display: inline-block; flex: none; }
   .key-line.dashed { border-top-style: dashed; }
 
@@ -628,6 +675,22 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <details class="table-view">
       <summary>首期 30+ 表格视图</summary>
       <div class="table-scroll" id="bin-table-1m30"></div>
+    </details>
+  </section>
+
+  <section class="card" id="dist-card" hidden>
+    <div class="card-head">
+      <h2>模型分分布（按申请周 · 申请样本）</h2>
+      <span class="hint">各分箱申请量占比；颜色越深 = 分箱越高（分数越差）</span>
+    </div>
+    <div class="legend" id="dist-legend"></div>
+    <div class="chart-box">
+      <svg class="chart" id="dist-chart" role="img" tabindex="0"></svg>
+      <div class="empty-state" id="dist-empty" hidden>当前筛选下暂无分布数据</div>
+    </div>
+    <details class="table-view">
+      <summary>表格视图</summary>
+      <div class="table-scroll" id="dist-table"></div>
     </details>
   </section>
 
@@ -1846,6 +1909,194 @@ function renderBinTable(label, suffix, weeks, model) {
   box.appendChild(table);
 }
 
+function distCount(week, model, bin) {
+  const byModel = ((DATA.dist && DATA.dist.rows) || {})[week];
+  const bins = byModel ? byModel[model] : undefined;
+  return bins ? bins[String(bin)] : undefined;
+}
+
+function visibleDistWeeks() {
+  if (!DATA.dist) return [];
+  return state.range === 'all'
+    ? DATA.dist.weeks.slice()
+    : DATA.dist.weeks.slice(-Number(state.range));
+}
+
+function renderDist() {
+  const card = $('#dist-card');
+  if (!DATA.dist || !DATA.dist.weeks.length) {
+    card.hidden = true;
+    return;
+  }
+  card.hidden = false;
+  renderDistLegend();
+  renderDistChart();
+  renderDistTable();
+}
+
+function renderDistLegend() {
+  const box = $('#dist-legend');
+  box.textContent = '';
+  for (let bin = 1; bin <= 5; bin++) {
+    const item = document.createElement('span');
+    item.className = 'item';
+    const swatch = document.createElement('span');
+    swatch.className = 'swatch';
+    swatch.style.background = cssVar('--dist-' + bin);
+    item.appendChild(swatch);
+    item.appendChild(document.createTextNode('箱 ' + bin));
+    box.appendChild(item);
+  }
+}
+
+function renderDistChart() {
+  const svg = $('#dist-chart');
+  const empty = $('#dist-empty');
+  clearSvg(svg);
+  const weeks = visibleDistWeeks();
+  const model = state.binModel;
+  const modelMeta = buildPayloadMaps().find((item) => item.key === model);
+  const modelName = modelMeta ? modelMeta.display : (model || '');
+
+  const totals = weeks.map((week) => {
+    let total = 0;
+    for (let bin = 1; bin <= 5; bin++) total += distCount(week, model, bin) || 0;
+    return total;
+  });
+  if (!weeks.length || !totals.some((total) => total > 0)) {
+    svg.style.display = 'none';
+    empty.hidden = false;
+    return;
+  }
+  svg.style.display = 'block';
+  empty.hidden = true;
+
+  const DIST_H = 300;
+  const plot = { left: M.left, top: M.top, width: SVG_W - M.left - M.right, height: DIST_H - M.top - M.bottom };
+  plot.y = (v) => plot.top + (1 - v) * plot.height;
+  svg.setAttribute('viewBox', `0 0 ${SVG_W} ${DIST_H}`);
+
+  svgEl('rect', {
+    x: plot.left, y: plot.top, width: plot.width, height: plot.height,
+    fill: '#fcfcfb', rx: 3,
+  }, svg);
+
+  const band = plot.width / weeks.length;
+  const barW = Math.min(24, band * 0.62);
+  const xOf = (i) => plot.left + (i + 0.5) * band;
+
+  const ticks = [0, 0.25, 0.5, 0.75, 1].map((v) => ({ value: v }));
+  drawYAxis(svg, plot, ticks, (v) => Math.round(v * 100) + '%');
+  drawXAxis(svg, plot, weeks, xOf, DIST_H);
+
+  weeks.forEach((week, i) => {
+    const total = totals[i];
+    if (!total) return;
+    let cum = 0;
+    for (let bin = 1; bin <= 5; bin++) {
+      const count = distCount(week, model, bin) || 0;
+      if (!count) continue;
+      const share = count / total;
+      const segTop = plot.top + (1 - cum - share) * plot.height;
+      const segH = Math.max(share * plot.height - 2, 1);
+      const x = xOf(i) - barW / 2;
+      const isTop = cum + share > 0.999999;
+      const radius = Math.min(4, segH / 2, barW / 2);
+      if (isTop && segH > 2 * radius) {
+        const d = `M${x},${segTop + segH} L${x},${segTop + radius}`
+          + ` Q${x},${segTop} ${x + radius},${segTop}`
+          + ` L${x + barW - radius},${segTop}`
+          + ` Q${x + barW},${segTop} ${x + barW},${segTop + radius}`
+          + ` L${x + barW},${segTop + segH} Z`;
+        svgEl('path', { d, fill: cssVar('--dist-' + bin) }, svg);
+      } else {
+        svgEl('rect', {
+          x, y: segTop, width: barW, height: segH, fill: cssVar('--dist-' + bin),
+        }, svg);
+      }
+      cum += share;
+    }
+  });
+
+  const crosshair = svgEl('line', {
+    y1: plot.top, y2: plot.top + plot.height, stroke: cssVar('--axis'),
+    'stroke-width': 1, visibility: 'hidden',
+  }, svg);
+
+  attachCrosshair(svg, SVG_W, plot.left, plot.width, weeks, {
+    show(index, clientX, clientY) {
+      const x = xOf(index);
+      crosshair.setAttribute('x1', x);
+      crosshair.setAttribute('x2', x);
+      crosshair.setAttribute('visibility', 'visible');
+      const total = totals[index];
+      showTooltip((tip) => {
+        const head = document.createElement('div');
+        head.className = 'tt-week';
+        head.textContent = weeks[index] + (modelName ? ' · ' + modelName : '');
+        tip.appendChild(head);
+        addTooltipRow(tip, null, '申请量', fmtInt.format(total));
+        for (let bin = 1; bin <= 5; bin++) {
+          const count = distCount(weeks[index], model, bin) || 0;
+          addTooltipRow(
+            tip,
+            cssVar('--dist-' + bin),
+            '箱 ' + bin,
+            total ? (count / total * 100).toFixed(1) + '% · ' + fmtInt.format(count) : '—'
+          );
+        }
+      }, clientX, clientY);
+    },
+    showAt(index) {
+      const rect = svg.getBoundingClientRect();
+      const scale = rect.width / SVG_W;
+      return { x: rect.left + xOf(index) * scale, y: rect.top + plot.top + plot.height / 2 };
+    },
+    hide() {
+      crosshair.setAttribute('visibility', 'hidden');
+      hideTooltip();
+    },
+  });
+}
+
+function renderDistTable() {
+  const box = $('#dist-table');
+  box.textContent = '';
+  const weeks = visibleDistWeeks();
+  const model = state.binModel;
+  if (!DATA.dist) return;
+  const table = document.createElement('table');
+  const thead = document.createElement('thead');
+  const headRow = document.createElement('tr');
+  ['周', '申请量'].concat([1, 2, 3, 4, 5].map((bin) => '箱 ' + bin)).forEach((text) => {
+    const th = document.createElement('th');
+    th.textContent = text;
+    headRow.appendChild(th);
+  });
+  thead.appendChild(headRow);
+  table.appendChild(thead);
+
+  const tbody = document.createElement('tbody');
+  weeks.slice().reverse().forEach((week) => {
+    let total = 0;
+    for (let bin = 1; bin <= 5; bin++) total += distCount(week, model, bin) || 0;
+    const tr = document.createElement('tr');
+    const cells = [week, total ? fmtInt.format(total) : '—'];
+    for (let bin = 1; bin <= 5; bin++) {
+      const count = distCount(week, model, bin) || 0;
+      cells.push(total ? (count / total * 100).toFixed(1) + '% (' + fmtInt.format(count) + ')' : '—');
+    }
+    cells.forEach((text) => {
+      const td = document.createElement('td');
+      td.textContent = text;
+      tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  box.appendChild(table);
+}
+
 function renderAll() {
   $('#meta-source').textContent = DATA.source ? '数据表 ' + DATA.source : '';
   $('#meta-generated').textContent = '生成于 ' + DATA.generatedAt;
@@ -1858,6 +2109,7 @@ function renderAll() {
   renderFunnel();
   renderBinModelOptions();
   renderBins();
+  renderDist();
 }
 
 $('#range-select').addEventListener('change', (event) => {
@@ -1868,6 +2120,7 @@ $('#range-select').addEventListener('change', (event) => {
 $('#bin-model-select').addEventListener('change', (event) => {
   state.binModel = event.target.value;
   renderBins();
+  renderDist();
 });
 
 renderPills();

@@ -409,3 +409,99 @@ FROM long
 WHERE model_bin IS NOT NULL
 GROUP BY time_key, label_name, model_name, model_bin
 ;
+
+-- =====================================================================
+-- 老客模型分分布（按申请周 · 申请样本）
+-- 各分箱的申请量占比，用于观察模型分人群分布漂移；与放款/表现无关
+-- =====================================================================
+
+DROP TABLE IF EXISTS model.tmp_eliam_risk_000004_strategy_weekly_score_dist;
+
+CREATE TABLE model.tmp_eliam_risk_000004_strategy_weekly_score_dist AS
+WITH base AS (
+    SELECT
+        CAST(cp.application_week AS STRING) AS time_key,
+
+        CASE
+            WHEN r.old_risk_bid_submodel_250909_txn IS NULL THEN NULL
+            WHEN r.old_risk_bid_submodel_250909_txn <= 0.052011 THEN 1
+            WHEN r.old_risk_bid_submodel_250909_txn <= 0.07337  THEN 2
+            WHEN r.old_risk_bid_submodel_250909_txn <= 0.099983 THEN 3
+            WHEN r.old_risk_bid_submodel_250909_txn <= 0.14444  THEN 4
+            ELSE 5
+        END AS bin_sub_v11,
+
+        CASE
+            WHEN r.old_risk_bid_mltmodel_v1_1_20251021 IS NULL THEN NULL
+            WHEN r.old_risk_bid_mltmodel_v1_1_20251021 <= 0.039873 THEN 1
+            WHEN r.old_risk_bid_mltmodel_v1_1_20251021 <= 0.057702 THEN 2
+            WHEN r.old_risk_bid_mltmodel_v1_1_20251021 <= 0.089551 THEN 3
+            WHEN r.old_risk_bid_mltmodel_v1_1_20251021 <= 0.149927 THEN 4
+            ELSE 5
+        END AS bin_mlt_v11,
+
+        CASE
+            WHEN r.old_risk_bid_appmodel_v1_1_20250911 IS NULL THEN NULL
+            WHEN r.old_risk_bid_appmodel_v1_1_20250911 <= 0.051164 THEN 1
+            WHEN r.old_risk_bid_appmodel_v1_1_20250911 <= 0.071347 THEN 2
+            WHEN r.old_risk_bid_appmodel_v1_1_20250911 <= 0.095801 THEN 3
+            WHEN r.old_risk_bid_appmodel_v1_1_20250911 <= 0.138524 THEN 4
+            ELSE 5
+        END AS bin_app_v11,
+
+        CASE
+            WHEN r.aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score IS NULL THEN NULL
+            WHEN r.aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score <= 0.045117 THEN 1
+            WHEN r.aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score <= 0.063512 THEN 2
+            WHEN r.aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score <= 0.087708 THEN 3
+            WHEN r.aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score <= 0.130728 THEN 4
+            ELSE 5
+        END AS bin_sub_v12,
+
+        CASE
+            WHEN r.old_risk_bid_mltmodel_v1_2_20260325 IS NULL THEN NULL
+            WHEN r.old_risk_bid_mltmodel_v1_2_20260325 <= 0.035078 THEN 1
+            WHEN r.old_risk_bid_mltmodel_v1_2_20260325 <= 0.054394 THEN 2
+            WHEN r.old_risk_bid_mltmodel_v1_2_20260325 <= 0.081105 THEN 3
+            WHEN r.old_risk_bid_mltmodel_v1_2_20260325 <= 0.132466 THEN 4
+            ELSE 5
+        END AS bin_mlt_v12,
+
+        CASE
+            WHEN r.aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score IS NULL THEN NULL
+            WHEN r.aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score <= 0.051725 THEN 1
+            WHEN r.aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score <= 0.069226 THEN 2
+            WHEN r.aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score <= 0.090624 THEN 3
+            WHEN r.aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score <= 0.1212   THEN 4
+            ELSE 5
+        END AS bin_app_v12
+
+    FROM model.tmp_eliam_risk_000004_strategy_run_log_v3 r
+    LEFT JOIN ba.customer_profile_rawdata cp
+        ON r.application_id = cp.application_id
+    WHERE r.app_order_desc = 1
+),
+
+long AS (
+    SELECT time_key, model_name, model_bin
+    FROM base
+    LATERAL VIEW STACK (
+        6,
+        'old_risk_bid_submodel_250909_txn', bin_sub_v11,
+        'aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score', bin_sub_v12,
+        'old_risk_bid_mltmodel_v1_1_20251021', bin_mlt_v11,
+        'old_risk_bid_mltmodel_v1_2_20260325', bin_mlt_v12,
+        'old_risk_bid_appmodel_v1_1_20250911', bin_app_v11,
+        'aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score', bin_app_v12
+    ) AS model_name, model_bin
+)
+SELECT
+    time_key,
+    model_name,
+    model_bin,
+    COUNT(*) AS application_cnt
+FROM long
+WHERE model_bin IS NOT NULL
+  AND time_key IS NOT NULL
+GROUP BY time_key, model_name, model_bin
+;
