@@ -76,6 +76,7 @@ def build_queries():
         raise ValueError(
             f"SQL 查询数 {len(statements)} 与 QUERY_SPECS 的 {len(QUERY_SPECS)} 条不一致；"
             "请同步更新 sync.py 的块号/文件名"
+            "（如果这个文件是建表脚本，请改用 python monitor.py）"
         )
     queries = [
         {**spec, "sql": statement}

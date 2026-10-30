@@ -1,6 +1,8 @@
-# sync.py 运行时产物
+# sync.py / monitor.py 运行时产物
 原始数据/
 同步日志/
+看板/
+vintage_data.zip
 model_monitor_data.zip
 
 # 本机数据库连接配置
