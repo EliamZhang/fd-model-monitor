@@ -1,4 +1,4 @@
-"""同步老客模型周度 AUC（1.1 / 1.2）与周度转化率，并生成自包含的 HTML 监控看板。
+"""同步老客模型周度 AUC、转化率与分箱坏账率，并生成自包含的 HTML 监控看板。
 
 用法（线上环境，脚本同目录需有提供 query_to_df(sql) 的 hive_config）：
     python monitor.py
@@ -7,7 +7,7 @@
 流程：
     1. 读取 fundo_model_monitor.sql，按分号拆成语句依次执行（DROP / CREATE / 可选 SELECT）
     2. 没有 SELECT 语句时，自动 SELECT * FROM CREATE 出来的每张表
-    3. AUC 结果写入 原始数据/model_monitor_auc.csv，转化结果写入 原始数据/model_monitor_funnel.csv，
+    3. 结果分别写入 原始数据/model_monitor_auc.csv、model_monitor_funnel.csv、model_monitor_bin.csv，
        并一起打包成 model_monitor_data.zip
     4. 生成根目录下的 model_monitor_dashboard.html（数据内嵌，离线可开）
 """
@@ -35,6 +35,7 @@ PROJECT_DIR = Path(__file__).resolve().parent
 SQL_FILE = PROJECT_DIR / "fundo_model_monitor.sql"
 CSV_FILE = PROJECT_DIR / "原始数据" / "model_monitor_auc.csv"
 FUNNEL_CSV_FILE = PROJECT_DIR / "原始数据" / "model_monitor_funnel.csv"
+BIN_CSV_FILE = PROJECT_DIR / "原始数据" / "model_monitor_bin.csv"
 ZIP_FILE = PROJECT_DIR / "model_monitor_data.zip"
 HTML_FILE = PROJECT_DIR / "model_monitor_dashboard.html"
 BUSINESS_TZ = timezone(timedelta(hours=8))
@@ -47,15 +48,21 @@ LABELS = [
     ("duedate_3m_30", "3 期 30+"),
 ]
 
-# (模型分字段, 展示用家族名, 版本)。版本用于 1.1 / 1.2 对比切换。
+# (模型分字段, 展示用家族名, 版本, 分箱阈值[箱1-4上限])。版本用于 1.1 / 1.2 对比切换。
 # mltmodel = 融合主模型；submodel = 银行流水子模型；appmodel = 行为子模型。
 MODELS = [
-    ("old_risk_bid_submodel_250909_txn", "submodel 银行流水子模型", "1.1"),
-    ("aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score", "submodel 银行流水子模型", "1.2"),
-    ("old_risk_bid_mltmodel_v1_1_20251021", "mltmodel 融合主模型", "1.1"),
-    ("old_risk_bid_mltmodel_v1_2_20260325", "mltmodel 融合主模型", "1.2"),
-    ("old_risk_bid_appmodel_v1_1_20250911", "appmodel 行为子模型", "1.1"),
-    ("aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score", "appmodel 行为子模型", "1.2"),
+    ("old_risk_bid_submodel_250909_txn", "submodel 银行流水子模型", "1.1",
+     [0.052011, 0.07337, 0.099983, 0.14444]),
+    ("aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score", "submodel 银行流水子模型", "1.2",
+     [0.045117, 0.063512, 0.087708, 0.130728]),
+    ("old_risk_bid_mltmodel_v1_1_20251021", "mltmodel 融合主模型", "1.1",
+     [0.039873, 0.057702, 0.089551, 0.149927]),
+    ("old_risk_bid_mltmodel_v1_2_20260325", "mltmodel 融合主模型", "1.2",
+     [0.035078, 0.054394, 0.081105, 0.132466]),
+    ("old_risk_bid_appmodel_v1_1_20250911", "appmodel 行为子模型", "1.1",
+     [0.051164, 0.071347, 0.095801, 0.138524]),
+    ("aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score", "appmodel 行为子模型", "1.2",
+     [0.051725, 0.069226, 0.090624, 0.1212]),
 ]
 
 _UNFUNDED = "UNFUNDED"
@@ -171,12 +178,12 @@ def build_payload(df):
 
     weeks = sorted(df["time_key"].unique(), key=natural_key)
     label_keys = [key for key, _ in LABELS]
-    model_keys = [key for key, _, _ in MODELS]
+    model_keys = [key for key, _, _, _ in MODELS]
     labels = [key for key in label_keys if key in set(df["label_name"])]
     labels += sorted(set(df["label_name"]) - set(labels))
     models = [key for key in model_keys if key in set(df["model_name"])]
     models += sorted(set(df["model_name"]) - set(models))
-    model_meta = {key: (family, version) for key, family, version in MODELS}
+    model_meta = {key: (family, version) for key, family, version, _ in MODELS}
 
     def number(value):
         return None if pd.isna(value) else float(value)
@@ -262,6 +269,39 @@ def build_funnel_payload(df):
     return {"weeks": weeks, "rows": rows}
 
 
+def build_bin_payload(df):
+    if df is None or len(df) == 0:
+        return None
+    required = {"time_key", "label_name", "model_name", "model_bin", "performance_cnt", "pos_cnt"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"分箱结果缺少字段：{', '.join(sorted(missing))}")
+
+    df = df.copy()
+    df["time_key"] = df["time_key"].astype(str)
+    df["time_key"] = df["time_key"].map(lambda value: week_start_date(value) or value)
+    df = df[df["time_key"].str.upper() != _UNFUNDED]
+    weeks = sorted(df["time_key"].unique(), key=natural_key)
+
+    rows = {}
+    for _, row in df.iterrows():
+        perf = int(row["performance_cnt"]) if pd.notna(row["performance_cnt"]) else None
+        pos = int(row["pos_cnt"]) if pd.notna(row["pos_cnt"]) else None
+        if perf is None and pos is None:
+            continue
+        rows.setdefault(row["label_name"], {}).setdefault(row["time_key"], {}).setdefault(
+            row["model_name"], {}
+        )[str(int(row["model_bin"]))] = {"perf": perf, "pos": pos}
+
+    bin_labels = [key for key in ("fpd7_flag", "duedate_1m_30") if key in rows]
+    return {
+        "weeks": weeks,
+        "labels": [{"key": key, "name": dict(LABELS).get(key, key)} for key in bin_labels],
+        "thresholds": {key: limits for key, _, _, limits in MODELS},
+        "rows": rows,
+    }
+
+
 def build_html(payload, source_name):
     payload = {**payload, "source": source_name or ""}
     data = json.dumps(payload, ensure_ascii=False)
@@ -269,24 +309,24 @@ def build_html(payload, source_name):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="同步模型周度 AUC / 转化率并生成 HTML 看板")
+    parser = argparse.ArgumentParser(description="同步模型周度 AUC / 转化率 / 分箱坏账率并生成 HTML 看板")
     parser.add_argument("--from-csv", help="不连库，直接用已导出的 AUC 结果 CSV 生成看板")
     parser.add_argument("--funnel-csv", help="配合 --from-csv 的转化率结果 CSV；默认取同目录 model_monitor_funnel.csv")
+    parser.add_argument("--bin-csv", help="配合 --from-csv 的分箱结果 CSV；默认取同目录 model_monitor_bin.csv")
     args = parser.parse_args(argv)
 
     source_table = None
     if args.from_csv:
         df = load_result(Path(args.from_csv))
-        funnel_path = (
-            Path(args.funnel_csv)
-            if args.funnel_csv
-            else Path(args.from_csv).with_name(FUNNEL_CSV_FILE.name)
-        )
-        if funnel_path.exists():
-            funnel_df = load_result(funnel_path)
-        else:
-            funnel_df = None
+        base_dir = Path(args.from_csv).parent
+        funnel_path = Path(args.funnel_csv) if args.funnel_csv else base_dir / FUNNEL_CSV_FILE.name
+        bin_path = Path(args.bin_csv) if args.bin_csv else base_dir / BIN_CSV_FILE.name
+        funnel_df = load_result(funnel_path) if funnel_path.exists() else None
+        if funnel_df is None:
             print(f"未找到转化数据 | {funnel_path}（看板将不显示转化区块）")
+        bin_df = load_result(bin_path) if bin_path.exists() else None
+        if bin_df is None:
+            print(f"未找到分箱数据 | {bin_path}（看板将不显示分箱区块）")
     else:
         try:
             from hive_config import query_to_df
@@ -296,6 +336,7 @@ def main(argv=None):
         results = run_sql_file(query_to_df)
         df, source_table = pick_result(results, "auc", 0)
         funnel_df, _ = pick_result(results, "funnel", 1)
+        bin_df, _ = pick_result(results, "bin", 2)
 
     if df is None or len(df) == 0:
         print("警告 | AUC 查询结果为空，看板将显示空状态")
@@ -311,18 +352,25 @@ def main(argv=None):
             funnel_df.to_csv(FUNNEL_CSV_FILE, index=False, encoding="utf-8-sig")
             written.append(FUNNEL_CSV_FILE)
             print(f"已保存转化 | {FUNNEL_CSV_FILE}（{len(funnel_df)} 行）")
+        if bin_df is not None:
+            bin_df.to_csv(BIN_CSV_FILE, index=False, encoding="utf-8-sig")
+            written.append(BIN_CSV_FILE)
+            print(f"已保存分箱 | {BIN_CSV_FILE}（{len(bin_df)} 行）")
         if written:
             write_zip(written)
             print(f"已打包 | {ZIP_FILE}")
 
     payload = build_payload(df)
     payload["funnel"] = build_funnel_payload(funnel_df)
+    payload["bins"] = build_bin_payload(bin_df)
     HTML_FILE.parent.mkdir(parents=True, exist_ok=True)
     HTML_FILE.write_text(build_html(payload, source_table), encoding="utf-8")
     print(f"已生成看板 | {HTML_FILE}")
     print(f"周数 {len(payload['weeks'])} | 标签 {len(payload['labels'])} | 模型 {len(payload['models'])}")
     if payload["funnel"]:
         print(f"转化周数 {len(payload['funnel']['weeks'])}")
+    if payload["bins"]:
+        print(f"分箱周数 {len(payload['bins']['weeks'])}")
     return 0
 
 
@@ -346,6 +394,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     --series-1: #2a78d6;
     --series-2: #eb6834;
     --series-3: #1baf7a;
+    --bin-1: #86b6ef;
+    --bin-2: #5598e7;
+    --bin-3: #2a78d6;
+    --bin-4: #1c5cab;
+    --bin-5: #104281;
     --good: #006300;
     --bad: #d03b3b;
     --wash: rgba(11, 11, 11, 0.04);
@@ -365,6 +418,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       --series-1: #3987e5;
       --series-2: #d95926;
       --series-3: #199e70;
+      --bin-1: #9ec5f4;
+      --bin-2: #6da7ec;
+      --bin-3: #3987e5;
+      --bin-4: #256abf;
+      --bin-5: #184f95;
       --good: #0ca30c;
       --bad: #e66767;
       --wash: rgba(255, 255, 255, 0.05);
@@ -399,6 +457,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     font: inherit; font-size: 13px; color: var(--ink); background: var(--surface);
     border: 1px solid var(--border); border-radius: 7px; padding: 5px 8px;
   }
+  .control { display: flex; align-items: center; gap: 8px; color: var(--ink-2); font-size: 13px; }
+  .control select {
+    font: inherit; font-size: 13px; color: var(--ink); background: var(--surface);
+    border: 1px solid var(--border); border-radius: 7px; padding: 5px 8px; max-width: 240px;
+  }
 
   .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; }
   .tile {
@@ -420,6 +483,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .card-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 18px; }
   .card h2 { font-size: 15px; font-weight: 620; margin: 0; }
   .card .hint { color: var(--muted); font-size: 12px; }
+  .sub-title { font-size: 13px; font-weight: 600; margin: 14px 0 2px; color: var(--ink-2); }
   .legend { display: flex; flex-wrap: wrap; gap: 14px; margin: 8px 0 2px; color: var(--ink-2); font-size: 12.5px; }
   .legend .item { display: inline-flex; align-items: center; gap: 6px; }
   .key-line { width: 16px; border-top: 2px solid; border-radius: 1px; display: inline-block; flex: none; }
@@ -478,6 +542,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div class="filters" role="toolbar" aria-label="筛选">
     <div class="pills" id="label-pills" role="group" aria-label="标签"></div>
     <div class="pills" id="version-pills" role="group" aria-label="版本"></div>
+    <label class="control">分箱模型
+      <select id="bin-model-select"></select>
+    </label>
     <label class="range">时间范围
       <select id="range-select">
         <option value="12">最近 12 周</option>
@@ -533,6 +600,32 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </details>
   </section>
 
+  <section class="card" id="bin-card" hidden>
+    <div class="card-head">
+      <h2>分箱坏账率（按放款周）</h2>
+      <span class="hint" id="bin-hint">箱 1 分数最低（最好）→ 箱 5 最差；数值 = 坏样本 / 已表现样本</span>
+    </div>
+    <div class="legend" id="bin-legend"></div>
+    <h3 class="sub-title">FPD7</h3>
+    <div class="chart-box">
+      <svg class="chart" id="bin-chart-fpd7" role="img" tabindex="0"></svg>
+      <div class="empty-state" id="bin-empty-fpd7" hidden>当前筛选下暂无分箱数据</div>
+    </div>
+    <details class="table-view">
+      <summary>FPD7 表格视图</summary>
+      <div class="table-scroll" id="bin-table-fpd7"></div>
+    </details>
+    <h3 class="sub-title">首期 30+</h3>
+    <div class="chart-box">
+      <svg class="chart" id="bin-chart-1m30" role="img" tabindex="0"></svg>
+      <div class="empty-state" id="bin-empty-1m30" hidden>当前筛选下暂无分箱数据</div>
+    </div>
+    <details class="table-view">
+      <summary>首期 30+ 表格视图</summary>
+      <div class="table-scroll" id="bin-table-1m30"></div>
+    </details>
+  </section>
+
   <p class="note">
     模型说明：mltmodel = 融合主模型，submodel = 银行流水子模型，appmodel = 行为子模型。
     口径说明：标签取自 ba.customer_profile_rawdata（FPD7）与 model.tmp_eliam_listing_vintage（首期/2 期/3 期），
@@ -547,10 +640,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 const DATA = __DATA_JSON__;
 
 const NS = 'http://www.w3.org/2000/svg';
-const state = { label: DATA.labels.length ? DATA.labels[0].key : null, range: '26', version: 'compare' };
+const state = { label: DATA.labels.length ? DATA.labels[0].key : null, range: '26', version: 'compare', binModel: null };
 const SVG_W = 960;
 const AUC_H = 350;
 const COUNT_H = 210;
+const BIN_H = 260;
 const M = { top: 18, right: 16, bottom: 30, left: 56 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -1450,6 +1544,233 @@ function renderFunnelTable(weeks) {
   box.appendChild(table);
 }
 
+function binPoint(label, week, model, bin) {
+  const byWeek = ((DATA.bins && DATA.bins.rows[label]) || {})[week];
+  const byModel = byWeek ? byWeek[model] : undefined;
+  return byModel ? byModel[String(bin)] : undefined;
+}
+
+function visibleBinWeeks() {
+  if (!DATA.bins) return [];
+  return state.range === 'all'
+    ? DATA.bins.weeks.slice()
+    : DATA.bins.weeks.slice(-Number(state.range));
+}
+
+function binIntervalText(model, bin) {
+  const limits = ((DATA.bins && DATA.bins.thresholds) || {})[model];
+  if (!limits || limits.length !== 4) return '';
+  const fmt = (value) => value.toFixed(4);
+  if (bin === 1) return '≤' + fmt(limits[0]);
+  if (bin === 5) return '>' + fmt(limits[3]);
+  return fmt(limits[bin - 2]) + '~' + fmt(limits[bin - 1]);
+}
+
+function binModelsForVersion() {
+  const all = buildPayloadMaps();
+  if (state.version === 'compare') return all;
+  return all.filter((model) => model.version === state.version);
+}
+
+function renderBinModelOptions() {
+  const select = $('#bin-model-select');
+  const models = binModelsForVersion();
+  select.textContent = '';
+  models.forEach((model) => {
+    const option = document.createElement('option');
+    option.value = model.key;
+    option.textContent = model.display;
+    select.appendChild(option);
+  });
+  if (!models.length) return;
+  const keys = models.map((model) => model.key);
+  if (!state.binModel || keys.indexOf(state.binModel) < 0) {
+    const preferred = models.find((model) => model.version === '1.2' && model.name.indexOf('mltmodel') === 0)
+      || models.find((model) => model.name.indexOf('mltmodel') === 0)
+      || models[0];
+    state.binModel = preferred.key;
+  }
+  select.value = state.binModel;
+}
+
+function renderBins() {
+  const card = $('#bin-card');
+  if (!DATA.bins || !DATA.bins.weeks.length) {
+    card.hidden = true;
+    return;
+  }
+  card.hidden = false;
+  const legend = $('#bin-legend');
+  legend.textContent = '';
+  for (let bin = 1; bin <= 5; bin++) {
+    const item = document.createElement('span');
+    item.className = 'item';
+    const key = document.createElement('span');
+    key.className = 'key-line';
+    key.style.borderTopColor = cssVar('--bin-' + bin);
+    item.appendChild(key);
+    item.appendChild(document.createTextNode('箱 ' + bin));
+    legend.appendChild(item);
+  }
+  const limits = ((DATA.bins.thresholds) || {})[state.binModel];
+  $('#bin-hint').textContent = limits && limits.length === 4
+    ? '箱 1-4 上限：' + limits.map((value) => value.toFixed(4)).join(' / ')
+      + '；箱 5 为以上。数值 = 坏样本 / 已表现样本'
+    : '箱 1 分数最低（最好）→ 箱 5 最差；数值 = 坏样本 / 已表现样本';
+  renderBinChart('fpd7_flag', 'fpd7');
+  renderBinChart('duedate_1m_30', '1m30');
+}
+
+function renderBinChart(label, suffix) {
+  const svg = $('#bin-chart-' + suffix);
+  const empty = $('#bin-empty-' + suffix);
+  clearSvg(svg);
+  svg.setAttribute('viewBox', `0 0 ${SVG_W} ${BIN_H}`);
+
+  const weeks = visibleBinWeeks();
+  const model = state.binModel;
+  const modelMeta = buildPayloadMaps().find((item) => item.key === model);
+  const modelName = modelMeta ? modelMeta.display : (model || '');
+
+  const series = [];
+  for (let bin = 1; bin <= 5; bin++) {
+    series.push({
+      bin,
+      color: cssVar('--bin-' + bin),
+      points: weeks.map((week, i) => {
+        const point = binPoint(label, week, model, bin);
+        if (!point || !point.perf) return null;
+        return { i, v: point.pos / point.perf, perf: point.perf, pos: point.pos };
+      }),
+    });
+  }
+  const values = [];
+  series.forEach((item) => item.points.forEach((point) => { if (point) values.push(point.v); }));
+  if (!weeks.length || !values.length) {
+    svg.style.display = 'none';
+    empty.hidden = false;
+    renderBinTable(label, suffix, weeks, model);
+    return;
+  }
+  svg.style.display = 'block';
+  empty.hidden = true;
+
+  const dataMax = Math.max(...values);
+  const step = niceStep(Math.max(dataMax, 0.02), 4);
+  const top = Math.ceil(dataMax / step) * step;
+  const plot = { left: M.left, top: M.top, width: SVG_W - M.left - M.right, height: BIN_H - M.top - M.bottom };
+  plot.y = (v) => plot.top + (1 - v / top) * plot.height;
+  const xOf = (i) => plot.left + (i + 0.5) * plot.width / weeks.length;
+
+  const ticks = [];
+  for (let v = 0; v <= top + 1e-9; v += step) ticks.push({ value: Number(v.toFixed(4)) });
+  drawYAxis(svg, plot, ticks, (v) => {
+    const pct = v * 100;
+    return (Number.isInteger(pct) ? pct.toFixed(0) : pct.toFixed(1)) + '%';
+  });
+  drawXAxis(svg, plot, weeks, xOf, BIN_H);
+
+  series.forEach((item) => {
+    let d = '';
+    let open = false;
+    item.points.forEach((point) => {
+      if (!point) { open = false; return; }
+      d += (open ? 'L' : 'M') + xOf(point.i) + ',' + plot.y(point.v) + ' ';
+      open = true;
+    });
+    if (d) {
+      svgEl('path', {
+        d, fill: 'none', stroke: item.color, 'stroke-width': 2,
+        'stroke-linejoin': 'round', 'stroke-linecap': 'round',
+      }, svg);
+    }
+  });
+
+  series.forEach((item) => {
+    const last = item.points.filter(Boolean).pop();
+    if (!last) return;
+    svgEl('circle', {
+      cx: xOf(last.i), cy: plot.y(last.v), r: 4, fill: item.color,
+      stroke: cssVar('--surface'), 'stroke-width': 2,
+    }, svg);
+  });
+
+  const crosshair = svgEl('line', {
+    y1: plot.top, y2: plot.top + plot.height, stroke: cssVar('--axis'),
+    'stroke-width': 1, visibility: 'hidden',
+  }, svg);
+
+  attachCrosshair(svg, SVG_W, plot.left, plot.width, weeks, {
+    show(index, clientX, clientY) {
+      const x = xOf(index);
+      crosshair.setAttribute('x1', x);
+      crosshair.setAttribute('x2', x);
+      crosshair.setAttribute('visibility', 'visible');
+      showTooltip((tip) => {
+        const head = document.createElement('div');
+        head.className = 'tt-week';
+        head.textContent = weeks[index] + (modelName ? ' · ' + modelName : '');
+        tip.appendChild(head);
+        series.forEach((item) => {
+          const point = item.points[index];
+          const interval = binIntervalText(model, item.bin);
+          const name = '箱 ' + item.bin + (interval ? ' (' + interval + ')' : '');
+          const value = point
+            ? (point.v * 100).toFixed(1) + '% · n ' + fmtInt.format(point.perf)
+            : '—';
+          addTooltipRow(tip, item.color, name, value);
+        });
+      }, clientX, clientY);
+    },
+    showAt(index) {
+      const svgRect = svg.getBoundingClientRect();
+      const scale = svgRect.width / SVG_W;
+      return { x: svgRect.left + xOf(index) * scale, y: svgRect.top + plot.top + plot.height / 2 };
+    },
+    hide() {
+      crosshair.setAttribute('visibility', 'hidden');
+      hideTooltip();
+    },
+  });
+
+  renderBinTable(label, suffix, weeks, model);
+}
+
+function renderBinTable(label, suffix, weeks, model) {
+  const box = $('#bin-table-' + suffix);
+  box.textContent = '';
+  if (!DATA.bins || !DATA.bins.rows[label]) return;
+  const table = document.createElement('table');
+  const thead = document.createElement('thead');
+  const headRow = document.createElement('tr');
+  ['周'].concat([1, 2, 3, 4, 5].map((bin) => '箱 ' + bin)).forEach((text) => {
+    const th = document.createElement('th');
+    th.textContent = text;
+    headRow.appendChild(th);
+  });
+  thead.appendChild(headRow);
+  table.appendChild(thead);
+
+  const tbody = document.createElement('tbody');
+  weeks.slice().reverse().forEach((week) => {
+    const tr = document.createElement('tr');
+    const tdWeek = document.createElement('td');
+    tdWeek.textContent = week;
+    tr.appendChild(tdWeek);
+    for (let bin = 1; bin <= 5; bin++) {
+      const point = binPoint(label, week, model, bin);
+      const td = document.createElement('td');
+      td.textContent = (point && point.perf)
+        ? (point.pos / point.perf * 100).toFixed(1) + '% (' + fmtInt.format(point.perf) + ')'
+        : '—';
+      tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  box.appendChild(table);
+}
+
 function renderAll() {
   $('#meta-source').textContent = DATA.source ? '数据表 ' + DATA.source : '';
   $('#meta-generated').textContent = '生成于 ' + DATA.generatedAt;
@@ -1460,11 +1781,18 @@ function renderAll() {
   renderCountChart(weeks);
   renderTable(weeks);
   renderFunnel();
+  renderBinModelOptions();
+  renderBins();
 }
 
 $('#range-select').addEventListener('change', (event) => {
   state.range = event.target.value;
   renderAll();
+});
+
+$('#bin-model-select').addEventListener('change', (event) => {
+  state.binModel = event.target.value;
+  renderBins();
 });
 
 renderPills();

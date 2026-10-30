@@ -280,3 +280,132 @@ FROM apps
 WHERE time_key IS NOT NULL
 GROUP BY time_key
 ;
+
+-- =====================================================================
+-- 老客 1.1 / 1.2 分箱坏账率（按放款周）
+-- 箱 1-5：分数从低到高（1 最好，5 最差），箱 5 为 > 第 4 个阈值
+-- 标签：FPD7、首期 30+
+-- =====================================================================
+
+DROP TABLE IF EXISTS model.tmp_eliam_risk_000004_strategy_weekly_bin;
+
+CREATE TABLE model.tmp_eliam_risk_000004_strategy_weekly_bin AS
+WITH base AS (
+    SELECT
+        COALESCE(CAST(cp.dispersal_week AS STRING), 'UNFUNDED') AS time_key,
+
+        -- v1.1 分箱
+        CASE
+            WHEN r.old_risk_bid_submodel_250909_txn IS NULL THEN NULL
+            WHEN r.old_risk_bid_submodel_250909_txn <= 0.052011 THEN 1
+            WHEN r.old_risk_bid_submodel_250909_txn <= 0.07337  THEN 2
+            WHEN r.old_risk_bid_submodel_250909_txn <= 0.099983 THEN 3
+            WHEN r.old_risk_bid_submodel_250909_txn <= 0.14444  THEN 4
+            ELSE 5
+        END AS bin_sub_v11,
+
+        CASE
+            WHEN r.old_risk_bid_mltmodel_v1_1_20251021 IS NULL THEN NULL
+            WHEN r.old_risk_bid_mltmodel_v1_1_20251021 <= 0.039873 THEN 1
+            WHEN r.old_risk_bid_mltmodel_v1_1_20251021 <= 0.057702 THEN 2
+            WHEN r.old_risk_bid_mltmodel_v1_1_20251021 <= 0.089551 THEN 3
+            WHEN r.old_risk_bid_mltmodel_v1_1_20251021 <= 0.149927 THEN 4
+            ELSE 5
+        END AS bin_mlt_v11,
+
+        CASE
+            WHEN r.old_risk_bid_appmodel_v1_1_20250911 IS NULL THEN NULL
+            WHEN r.old_risk_bid_appmodel_v1_1_20250911 <= 0.051164 THEN 1
+            WHEN r.old_risk_bid_appmodel_v1_1_20250911 <= 0.071347 THEN 2
+            WHEN r.old_risk_bid_appmodel_v1_1_20250911 <= 0.095801 THEN 3
+            WHEN r.old_risk_bid_appmodel_v1_1_20250911 <= 0.138524 THEN 4
+            ELSE 5
+        END AS bin_app_v11,
+
+        -- v1.2 分箱
+        CASE
+            WHEN r.aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score IS NULL THEN NULL
+            WHEN r.aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score <= 0.045117 THEN 1
+            WHEN r.aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score <= 0.063512 THEN 2
+            WHEN r.aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score <= 0.087708 THEN 3
+            WHEN r.aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score <= 0.130728 THEN 4
+            ELSE 5
+        END AS bin_sub_v12,
+
+        CASE
+            WHEN r.old_risk_bid_mltmodel_v1_2_20260325 IS NULL THEN NULL
+            WHEN r.old_risk_bid_mltmodel_v1_2_20260325 <= 0.035078 THEN 1
+            WHEN r.old_risk_bid_mltmodel_v1_2_20260325 <= 0.054394 THEN 2
+            WHEN r.old_risk_bid_mltmodel_v1_2_20260325 <= 0.081105 THEN 3
+            WHEN r.old_risk_bid_mltmodel_v1_2_20260325 <= 0.132466 THEN 4
+            ELSE 5
+        END AS bin_mlt_v12,
+
+        CASE
+            WHEN r.aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score IS NULL THEN NULL
+            WHEN r.aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score <= 0.051725 THEN 1
+            WHEN r.aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score <= 0.069226 THEN 2
+            WHEN r.aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score <= 0.090624 THEN 3
+            WHEN r.aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score <= 0.1212   THEN 4
+            ELSE 5
+        END AS bin_app_v12,
+
+        CAST(CASE
+            WHEN cp.application_status = '4.Funded'
+             AND cp.first_payment_scheduled_date < CURRENT_DATE() - 7
+             AND cp.first_payment_days_past_due_ever > 7
+            THEN 1
+            WHEN cp.application_status = '4.Funded'
+             AND cp.first_payment_scheduled_date < CURRENT_DATE() - 7
+            THEN 0
+            ELSE NULL
+        END AS INT) AS fpd7_flag,
+
+        CAST(lv.duedate_1m_30 AS INT) AS duedate_1m_30
+    FROM model.tmp_eliam_risk_000004_strategy_run_log_v3 r
+    LEFT JOIN ba.customer_profile_rawdata cp
+        ON r.application_id = cp.application_id
+    LEFT JOIN model.tmp_eliam_listing_vintage lv
+        ON r.application_id = lv.application_id
+    WHERE r.app_order_desc = 1
+),
+
+long AS (
+    SELECT
+        time_key,
+        label_name,
+        model_name,
+        model_bin,
+        label_value
+    FROM base
+    LATERAL VIEW STACK (
+        12,
+
+        'fpd7_flag','old_risk_bid_submodel_250909_txn',bin_sub_v11,fpd7_flag,
+        'fpd7_flag','aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score',bin_sub_v12,fpd7_flag,
+        'fpd7_flag','old_risk_bid_mltmodel_v1_1_20251021',bin_mlt_v11,fpd7_flag,
+        'fpd7_flag','old_risk_bid_mltmodel_v1_2_20260325',bin_mlt_v12,fpd7_flag,
+        'fpd7_flag','old_risk_bid_appmodel_v1_1_20250911',bin_app_v11,fpd7_flag,
+        'fpd7_flag','aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score',bin_app_v12,fpd7_flag,
+
+        'duedate_1m_30','old_risk_bid_submodel_250909_txn',bin_sub_v11,duedate_1m_30,
+        'duedate_1m_30','aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score',bin_sub_v12,duedate_1m_30,
+        'duedate_1m_30','old_risk_bid_mltmodel_v1_1_20251021',bin_mlt_v11,duedate_1m_30,
+        'duedate_1m_30','old_risk_bid_mltmodel_v1_2_20260325',bin_mlt_v12,duedate_1m_30,
+        'duedate_1m_30','old_risk_bid_appmodel_v1_1_20250911',bin_app_v11,duedate_1m_30,
+        'duedate_1m_30','aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score',bin_app_v12,duedate_1m_30
+    ) AS label_name, model_name, model_bin, label_value
+)
+SELECT
+    time_key,
+    label_name,
+    model_name,
+    model_bin,
+    COUNT(*) AS application_cnt,
+    SUM(CASE WHEN label_value IN (0,1) THEN 1 END) AS performance_cnt,
+    SUM(CASE WHEN label_value = 1 THEN 1 END) AS pos_cnt,
+    SUM(CASE WHEN label_value = 0 THEN 1 END) AS neg_cnt
+FROM long
+WHERE model_bin IS NOT NULL
+GROUP BY time_key, label_name, model_name, model_bin
+;
