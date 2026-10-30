@@ -396,16 +396,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     --series-1: #2a78d6;
     --series-2: #eb6834;
     --series-3: #1baf7a;
-    --bin-1: #86b6ef;
-    --bin-2: #5598e7;
-    --bin-3: #2a78d6;
-    --bin-4: #1c5cab;
-    --bin-5: #104281;
-    --seq-0: #cde2fb;
-    --seq-1: #86b6ef;
-    --seq-2: #3987e5;
-    --seq-3: #1c5cab;
-    --seq-4: #0d366b;
+    --seq-0: #fce8e8;
+    --seq-1: #f5b5b5;
+    --seq-2: #e87676;
+    --seq-3: #cf3b3b;
+    --seq-4: #8e1d1d;
     --good: #006300;
     --bad: #d03b3b;
     --wash: rgba(11, 11, 11, 0.04);
@@ -425,16 +420,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       --series-1: #3987e5;
       --series-2: #d95926;
       --series-3: #199e70;
-      --bin-1: #9ec5f4;
-      --bin-2: #6da7ec;
-      --bin-3: #3987e5;
-      --bin-4: #256abf;
-      --bin-5: #184f95;
-      --seq-0: #184f95;
-      --seq-1: #256abf;
-      --seq-2: #3987e5;
-      --seq-3: #9ec5f4;
-      --seq-4: #cde2fb;
+      --seq-0: #5f1919;
+      --seq-1: #9c2626;
+      --seq-2: #d13c3c;
+      --seq-3: #ec7a7a;
+      --seq-4: #f7bcbc;
       --good: #0ca30c;
       --bad: #e66767;
       --wash: rgba(255, 255, 255, 0.05);
@@ -617,7 +607,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <section class="card" id="bin-card" hidden>
     <div class="card-head">
       <h2>分箱坏账率（按放款周）</h2>
-      <span class="hint" id="bin-hint">行为周（新 → 旧），列为箱 1-5；颜色越深坏账率越高</span>
+      <span class="hint" id="bin-hint">行为箱 1-5，列为周（左旧右新）；颜色越深坏账率越高</span>
     </div>
     <h3 class="sub-title">FPD7</h3>
     <div class="scale-legend" id="bin-scale-fpd7"></div>
@@ -1617,7 +1607,7 @@ function renderBins() {
   const limits = ((DATA.bins.thresholds) || {})[state.binModel];
   $('#bin-hint').textContent = (limits && limits.length === 4
     ? '箱 1-4 上限：' + limits.map((value) => value.toFixed(4)).join(' / ') + '；箱 5 为以上。'
-    : '') + '行为周（新 → 旧），列为分箱；颜色越深坏账率越高';
+    : '') + '行为箱 1-5，列为周（左旧右新）；颜色越深坏账率越高';
   renderBinHeatmap('fpd7_flag', 'fpd7');
   renderBinHeatmap('duedate_1m_30', '1m30');
 }
@@ -1674,7 +1664,7 @@ function renderBinHeatmap(label, suffix) {
   scaleBox.textContent = '';
 
   const allWeeks = visibleBinWeeks();
-  const weeks = allWeeks.slice().reverse();
+  const weeks = allWeeks;
   const model = state.binModel;
   const modelMeta = buildPayloadMaps().find((item) => item.key === model);
   const modelName = modelMeta ? modelMeta.display : (model || '');
@@ -1697,55 +1687,56 @@ function renderBinHeatmap(label, suffix) {
 
   const step = niceStep(Math.max(maxRate, 0.02), 4);
   const top = Math.ceil(maxRate / step) * step;
-  const rows = weeks.length;
-  const cellH = Math.max(14, Math.min(22, Math.floor(560 / rows)));
   const plot = { left: M.left, top: M.top, width: SVG_W - M.left - M.right };
-  const cellW = plot.width / 5;
-  svg.setAttribute('viewBox', `0 0 ${SVG_W} ${plot.top + rows * cellH + 28}`);
+  const cellW = plot.width / weeks.length;
+  const cellH = Math.min(40, Math.max(24, Math.floor(cellW)));
+  const height = plot.top + 5 * cellH + 30;
+  svg.setAttribute('viewBox', `0 0 ${SVG_W} ${height}`);
 
-  const labelStep = rows <= 30 ? 1 : Math.ceil(rows / 26);
-  weeks.forEach((week, r) => {
-    if (r % labelStep !== 0) return;
-    const text = svgEl('text', {
-      x: plot.left - 8, y: plot.top + r * cellH + cellH / 2 + 3.5,
-      'text-anchor': 'end', 'font-size': 10.5, fill: cssVar('--muted'),
-      'font-variant-numeric': 'tabular-nums',
-    }, svg);
-    text.textContent = shortWeek(week);
-  });
+  const xOf = (i) => plot.left + (i + 0.5) * cellW;
 
   for (let bin = 1; bin <= 5; bin++) {
     const text = svgEl('text', {
-      x: plot.left + (bin - 0.5) * cellW, y: plot.top + rows * cellH + 16,
-      'text-anchor': 'middle', 'font-size': 11, fill: cssVar('--muted'),
+      x: plot.left - 8, y: plot.top + (bin - 0.5) * cellH + 3.5,
+      'text-anchor': 'end', 'font-size': 10.5, fill: cssVar('--muted'),
     }, svg);
     text.textContent = '箱 ' + bin;
   }
+
+  drawXAxis(svg, plot, weeks, xOf, height);
 
   const outline = svgEl('rect', {
     fill: 'none', stroke: cssVar('--ink'), 'stroke-width': 2, visibility: 'hidden',
     'pointer-events': 'none',
   }, svg);
 
-  weeks.forEach((week, r) => {
+  weeks.forEach((week, col) => {
     for (let bin = 1; bin <= 5; bin++) {
       const point = binPoint(label, week, model, bin);
       if (!point || !point.perf) continue;
       const rate = point.pos / point.perf;
       const fill = seqFill(rate / top);
-      const x = plot.left + (bin - 1) * cellW;
-      const y = plot.top + r * cellH;
+      const x = plot.left + col * cellW;
+      const y = plot.top + (bin - 1) * cellH;
       const rect = svgEl('rect', {
         x: x + 1, y: y + 1, width: cellW - 2, height: cellH - 2, fill,
       }, svg);
-      if (cellH >= 14) {
+      if (cellW >= 30) {
         const text = svgEl('text', {
           x: x + cellW / 2, y: y + cellH / 2 + 3.5,
-          'text-anchor': 'middle', 'font-size': Math.min(11, cellH - 5),
+          'text-anchor': 'middle', 'font-size': 10,
           fill: textOnFill(fill), 'font-variant-numeric': 'tabular-nums',
           'pointer-events': 'none',
         }, svg);
         text.textContent = (rate * 100).toFixed(1) + '%';
+      } else if (cellW >= 16) {
+        const text = svgEl('text', {
+          x: x + cellW / 2, y: y + cellH / 2 + 3.5,
+          'text-anchor': 'middle', 'font-size': 9,
+          fill: textOnFill(fill), 'font-variant-numeric': 'tabular-nums',
+          'pointer-events': 'none',
+        }, svg);
+        text.textContent = Math.round(rate * 100) + '%';
       }
       const highlight = () => {
         outline.setAttribute('x', x + 1);
@@ -1766,7 +1757,7 @@ function renderBinHeatmap(label, suffix) {
   });
 
   let activeRow = 0;
-  let activeCol = 0;
+  let activeCol = weeks.length - 1;
   const paintActive = (showTip) => {
     const x = plot.left + activeCol * cellW;
     const y = plot.top + activeRow * cellH;
@@ -1775,8 +1766,8 @@ function renderBinHeatmap(label, suffix) {
     outline.setAttribute('width', cellW - 2);
     outline.setAttribute('height', cellH - 2);
     outline.setAttribute('visibility', 'visible');
-    const week = weeks[activeRow];
-    const bin = activeCol + 1;
+    const week = weeks[activeCol];
+    const bin = activeRow + 1;
     const point = binPoint(label, week, model, bin);
     if (point && point.perf && showTip) {
       const rect = svg.getBoundingClientRect();
@@ -1798,8 +1789,8 @@ function renderBinHeatmap(label, suffix) {
     const delta = { ArrowUp: [-1, 0], ArrowDown: [1, 0], ArrowLeft: [0, -1], ArrowRight: [0, 1] }[event.key];
     if (!delta) return;
     event.preventDefault();
-    activeRow = Math.min(Math.max(activeRow + delta[0], 0), rows - 1);
-    activeCol = Math.min(Math.max(activeCol + delta[1], 0), 4);
+    activeRow = Math.min(Math.max(activeRow + delta[0], 0), 4);
+    activeCol = Math.min(Math.max(activeCol + delta[1], 0), weeks.length - 1);
     paintActive(true);
   };
 
