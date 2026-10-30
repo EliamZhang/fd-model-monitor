@@ -8,7 +8,7 @@
     1. 读取 fundo_model_monitor.sql，按分号拆成语句依次执行（DROP / CREATE / 可选 SELECT）
     2. 没有 SELECT 语句时，自动 SELECT * FROM CREATE 出来的表
     3. 结果写入 原始数据/model_monitor_auc.csv，并打包成 model_monitor_data.zip
-    4. 生成 看板/model_monitor_dashboard.html（数据内嵌，离线可开）
+    4. 生成根目录下的 model_monitor_dashboard.html（数据内嵌，离线可开）
 """
 
 import argparse
@@ -34,7 +34,7 @@ PROJECT_DIR = Path(__file__).resolve().parent
 SQL_FILE = PROJECT_DIR / "fundo_model_monitor.sql"
 CSV_FILE = PROJECT_DIR / "原始数据" / "model_monitor_auc.csv"
 ZIP_FILE = PROJECT_DIR / "model_monitor_data.zip"
-HTML_FILE = PROJECT_DIR / "看板" / "model_monitor_dashboard.html"
+HTML_FILE = PROJECT_DIR / "model_monitor_dashboard.html"
 BUSINESS_TZ = timezone(timedelta(hours=8))
 
 # 看板中的展示顺序与显示名

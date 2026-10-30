@@ -1,9 +1,7 @@
 # sync.py / monitor.py 运行时产物
 原始数据/
-同步日志/
-看板/
-vintage_data.zip
 model_monitor_data.zip
+model_monitor_dashboard.html
 
 # 本机数据库连接配置
 hive_config.py

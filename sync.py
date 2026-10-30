@@ -6,12 +6,9 @@
 """
 
 import argparse
-import hashlib
-import json
 import re
 import sys
 import zipfile
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -27,13 +24,9 @@ PROJECT_DIR = Path(__file__).resolve().parent
 SQL_FILE = PROJECT_DIR / "fundo_model_monitor.sql"
 
 RAW_DIR = PROJECT_DIR / "原始数据"
-LOG_DIR = PROJECT_DIR / "同步日志"
-MANIFEST_FILE = LOG_DIR / "sync_manifest.json"
-FAILED_FILE = LOG_DIR / "failed_tables.csv"
 ZIP_FILE = PROJECT_DIR / "model_monitor_data.zip"
 
 RAW_DIR_NAME = "原始数据"
-BUSINESS_TZ = timezone(timedelta(hours=8))
 
 # 块号 → 输出文件。顺序必须与 SQL 中 SET 之后的 SELECT 一一对应。
 QUERY_SPECS = (
@@ -42,22 +35,6 @@ QUERY_SPECS = (
 
 _BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", flags=re.S)
 _LINE_COMMENT_RE = re.compile(r"--[^\n]*")
-
-
-def now():
-    return datetime.now(BUSINESS_TZ)
-
-
-def query_digest(sql):
-    return hashlib.sha256(sql.encode("utf-8")).hexdigest()
-
-
-def file_digest(path, chunk_size=1024 * 1024):
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(chunk_size), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def split_statements(sql_text):
@@ -106,23 +83,8 @@ def relative_path(query):
     return f"{RAW_DIR_NAME}/{query['file']}.csv"
 
 
-def save_manifest(manifest):
-    temporary = MANIFEST_FILE.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(MANIFEST_FILE)
-
-
 def run_sync(setup_statements, queries, query_fn):
-    for folder in (RAW_DIR, LOG_DIR):
-        folder.mkdir(parents=True, exist_ok=True)
-
-    manifest = {
-        "sql_file": SQL_FILE.name,
-        "sql_sha256": query_digest(SQL_FILE.read_text(encoding="utf-8")),
-        "run_at": now().isoformat(timespec="seconds"),
-        "queries": {},
-    }
-    save_manifest(manifest)
+    RAW_DIR.mkdir(parents=True, exist_ok=True)
 
     for setup_sql in setup_statements:
         print(f"全局 SET | {setup_sql}")
@@ -132,22 +94,12 @@ def run_sync(setup_statements, queries, query_fn):
             print(f"警告 | 全局 SET 执行失败：{exc}")
             print("      请确认 query_to_df 使用同一会话，或执行环境已设置 Australia/Sydney 时区。")
 
-    failed = []
+    failed = 0
     succeeded = []
     for index, query in enumerate(queries, start=1):
         block = query["id"]
         path = target_path(query)
         print(f"\n[{index}/{len(queries)}] {block}. {query['title']} → {RAW_DIR_NAME}/{path.name}")
-
-        entry = {
-            "title": query["title"],
-            "file": relative_path(query),
-            "sql_sha256": query_digest(query["sql"]),
-            "started_at": now().isoformat(timespec="seconds"),
-            "status": "running",
-        }
-        manifest["queries"][block] = entry
-        save_manifest(manifest)
 
         # 删掉上一次的文件，失败时目录里不会留下看似成功的旧结果。
         if path.exists():
@@ -168,33 +120,11 @@ def run_sync(setup_statements, queries, query_fn):
                 if temporary.exists():
                     temporary.unlink()
 
-            entry.update(
-                status="success",
-                rows=int(len(df)),
-                columns=list(df.columns),
-                file_sha256=file_digest(path),
-            )
             succeeded.append((path, relative_path(query)))
             print(f"成功 | {len(df)} 行 × {len(df.columns)} 列 | {path}")
         except Exception as exc:
-            entry.update(status="failed", error=str(exc))
-            failed.append(
-                {
-                    "block": block,
-                    "file": query["file"],
-                    "error": str(exc),
-                    "run_time": entry["started_at"],
-                }
-            )
+            failed += 1
             print(f"失败 | {exc}")
-        finally:
-            entry["finished_at"] = now().isoformat(timespec="seconds")
-            save_manifest(manifest)
-
-    pd.DataFrame(
-        failed,
-        columns=["block", "file", "error", "run_time"],
-    ).to_csv(FAILED_FILE, index=False, encoding="utf-8-sig")
 
     if succeeded:
         temporary_zip = ZIP_FILE.with_suffix(".zip.tmp")
@@ -207,15 +137,13 @@ def run_sync(setup_statements, queries, query_fn):
     else:
         print(f"\n本次没有可打包的成功结果，未更新 {ZIP_FILE.name}")
 
-    print(f"\n成功：{len(succeeded)} / 本次失败：{len(failed)}")
+    print(f"\n成功：{len(succeeded)} / 本次失败：{failed}")
     print(f"输出目录：{RAW_DIR.resolve()}")
-    print(f"失败清单：{FAILED_FILE.resolve()}")
-    print(f"运行清单：{MANIFEST_FILE.resolve()}")
     return 1 if failed else 0
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="执行 wagego_04_vintage分析.sql 并打包产出数据。")
+    parser = argparse.ArgumentParser(description="执行 fundo_model_monitor.sql 并打包产出数据。")
     parser.add_argument("--blocks", help="只执行指定块，逗号分隔，如 1,3,5a,5b,6,7")
     parser.add_argument("--dry-run", action="store_true", help="只检查块号和输出文件名，不连接数据库")
     args = parser.parse_args(argv)
