@@ -1,4 +1,4 @@
-"""同步老客模型周度 AUC（1.1 / 1.2），并生成自包含的 HTML 监控看板。
+"""同步老客模型周度 AUC（1.1 / 1.2）与周度转化率，并生成自包含的 HTML 监控看板。
 
 用法（线上环境，脚本同目录需有提供 query_to_df(sql) 的 hive_config）：
     python monitor.py
@@ -6,8 +6,9 @@
 
 流程：
     1. 读取 fundo_model_monitor.sql，按分号拆成语句依次执行（DROP / CREATE / 可选 SELECT）
-    2. 没有 SELECT 语句时，自动 SELECT * FROM CREATE 出来的表
-    3. 结果写入 原始数据/model_monitor_auc.csv，并打包成 model_monitor_data.zip
+    2. 没有 SELECT 语句时，自动 SELECT * FROM CREATE 出来的每张表
+    3. AUC 结果写入 原始数据/model_monitor_auc.csv，转化结果写入 原始数据/model_monitor_funnel.csv，
+       并一起打包成 model_monitor_data.zip
     4. 生成根目录下的 model_monitor_dashboard.html（数据内嵌，离线可开）
 """
 
@@ -33,6 +34,7 @@ if hasattr(sys.stderr, "reconfigure"):
 PROJECT_DIR = Path(__file__).resolve().parent
 SQL_FILE = PROJECT_DIR / "fundo_model_monitor.sql"
 CSV_FILE = PROJECT_DIR / "原始数据" / "model_monitor_auc.csv"
+FUNNEL_CSV_FILE = PROJECT_DIR / "原始数据" / "model_monitor_funnel.csv"
 ZIP_FILE = PROJECT_DIR / "model_monitor_data.zip"
 HTML_FILE = PROJECT_DIR / "model_monitor_dashboard.html"
 BUSINESS_TZ = timezone(timedelta(hours=8))
@@ -92,30 +94,40 @@ def first_line(sql, width=90):
 
 
 def run_sql_file(query_fn):
-    """按顺序执行 SQL 文件中的语句，返回结果 DataFrame。"""
+    """按顺序执行 SQL 文件中的语句，返回 [(表名或 None, DataFrame), ...]。"""
     statements = split_statements(SQL_FILE.read_text(encoding="utf-8"))
     if not statements:
         raise ValueError(f"{SQL_FILE.name} 中没有可执行语句")
 
-    target_table = None
-    result = None
+    targets = []
+    results = []
     for index, statement in enumerate(statements, start=1):
         print(f"执行 [{index}/{len(statements)}] | {first_line(statement)}")
         match = _CREATE_RE.search(statement)
         if match:
-            target_table = match.group(1)
+            targets.append(match.group(1))
         output = query_fn(statement)
         if isinstance(output, pd.DataFrame) and len(output.columns) > 0:
-            result = output
+            results.append((None, output))
 
-    if result is None:
-        if not target_table:
+    if not results:
+        if not targets:
             raise ValueError("SQL 文件里既没有 SELECT 结果，也没能解析出 CREATE TABLE 的目标表名")
-        pull_sql = f"SELECT * FROM {target_table}"
-        print(f"拉取结果 | {pull_sql}")
-        result = query_fn(pull_sql)
+        for table in targets:
+            pull_sql = f"SELECT * FROM {table}"
+            print(f"拉取结果 | {pull_sql}")
+            results.append((table, query_fn(pull_sql)))
 
-    return result, target_table
+    return results
+
+
+def pick_result(results, keyword, fallback_index):
+    for name, frame in results:
+        if name and keyword in name.lower():
+            return frame, name
+    if len(results) > fallback_index:
+        return results[fallback_index][1], results[fallback_index][0]
+    return None, None
 
 
 def load_result(path):
@@ -123,16 +135,27 @@ def load_result(path):
     return pd.read_csv(path, encoding="utf-8-sig")
 
 
-def write_zip(csv_path):
+def write_zip(csv_paths):
     """把结果 CSV 按 原始数据/ 目录结构打包，方便整包拉回本地。"""
     temporary = ZIP_FILE.with_suffix(".zip.tmp")
     with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("原始数据/", "")
-        archive.write(csv_path, f"原始数据/{csv_path.name}")
+        for csv_path in csv_paths:
+            archive.write(csv_path, f"原始数据/{csv_path.name}")
     temporary.replace(ZIP_FILE)
 
 
 def build_payload(df):
+    if df is None:
+        return {
+            "generatedAt": now().isoformat(timespec="seconds"),
+            "labels": [],
+            "models": [],
+            "weeks": [],
+            "rows": {},
+            "maturity": {},
+            "maturityThreshold": MATURITY_THRESHOLD,
+        }
     required = {
         "time_key", "label_name", "model_name", "auc",
         "total_application_cnt", "performance_cnt", "pos_cnt", "neg_cnt",
@@ -208,6 +231,37 @@ def build_payload(df):
     }
 
 
+def build_funnel_payload(df):
+    if df is None or len(df) == 0:
+        return None
+    required = {"time_key", "application_cnt", "completed_cnt", "approved_cnt", "deal_cnt"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"转化结果缺少字段：{', '.join(sorted(missing))}")
+
+    df = df.copy()
+    df["time_key"] = df["time_key"].astype(str)
+    df["time_key"] = df["time_key"].map(lambda value: week_start_date(value) or value)
+    df = df[df["time_key"].str.lower() != "nan"]
+    weeks = sorted(df["time_key"].unique(), key=natural_key)
+
+    def integer(row, column):
+        return int(row[column]) if column in row.index and pd.notna(row[column]) else None
+
+    rows = {}
+    for _, row in df.iterrows():
+        rows[row["time_key"]] = {
+            "apply": integer(row, "application_cnt"),
+            "completed": integer(row, "completed_cnt"),
+            "approved": integer(row, "approved_cnt"),
+            "auto": integer(row, "auto_approved_cnt"),
+            "manual": integer(row, "manual_approved_cnt"),
+            "deal": integer(row, "deal_cnt"),
+            "funded": integer(row, "funded_cnt"),
+        }
+    return {"weeks": weeks, "rows": rows}
+
+
 def build_html(payload, source_name):
     payload = {**payload, "source": source_name or ""}
     data = json.dumps(payload, ensure_ascii=False)
@@ -215,36 +269,60 @@ def build_html(payload, source_name):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="同步模型周度 AUC 并生成 HTML 看板")
-    parser.add_argument("--from-csv", help="不连库，直接用已导出的结果 CSV 生成看板")
+    parser = argparse.ArgumentParser(description="同步模型周度 AUC / 转化率并生成 HTML 看板")
+    parser.add_argument("--from-csv", help="不连库，直接用已导出的 AUC 结果 CSV 生成看板")
+    parser.add_argument("--funnel-csv", help="配合 --from-csv 的转化率结果 CSV；默认取同目录 model_monitor_funnel.csv")
     args = parser.parse_args(argv)
 
-    target_table = None
+    source_table = None
     if args.from_csv:
         df = load_result(Path(args.from_csv))
+        funnel_path = (
+            Path(args.funnel_csv)
+            if args.funnel_csv
+            else Path(args.from_csv).with_name(FUNNEL_CSV_FILE.name)
+        )
+        if funnel_path.exists():
+            funnel_df = load_result(funnel_path)
+        else:
+            funnel_df = None
+            print(f"未找到转化数据 | {funnel_path}（看板将不显示转化区块）")
     else:
         try:
             from hive_config import query_to_df
         except ImportError:
             print("未找到 hive_config.py：请把提供 query_to_df(sql) 的模块放到本脚本同目录或 PYTHONPATH 中。")
             return 2
-        df, target_table = run_sql_file(query_to_df)
+        results = run_sql_file(query_to_df)
+        df, source_table = pick_result(results, "auc", 0)
+        funnel_df, _ = pick_result(results, "funnel", 1)
 
     if df is None or len(df) == 0:
-        print("警告 | 查询结果为空，看板将显示空状态")
+        print("警告 | AUC 查询结果为空，看板将显示空状态")
 
     if not args.from_csv:
         CSV_FILE.parent.mkdir(parents=True, exist_ok=True)
-        df.to_csv(CSV_FILE, index=False, encoding="utf-8-sig")
-        write_zip(CSV_FILE)
-        print(f"已保存结果 | {CSV_FILE}（{len(df)} 行）")
-        print(f"已打包 | {ZIP_FILE}")
+        written = []
+        if df is not None:
+            df.to_csv(CSV_FILE, index=False, encoding="utf-8-sig")
+            written.append(CSV_FILE)
+            print(f"已保存结果 | {CSV_FILE}（{len(df)} 行）")
+        if funnel_df is not None:
+            funnel_df.to_csv(FUNNEL_CSV_FILE, index=False, encoding="utf-8-sig")
+            written.append(FUNNEL_CSV_FILE)
+            print(f"已保存转化 | {FUNNEL_CSV_FILE}（{len(funnel_df)} 行）")
+        if written:
+            write_zip(written)
+            print(f"已打包 | {ZIP_FILE}")
 
     payload = build_payload(df)
+    payload["funnel"] = build_funnel_payload(funnel_df)
     HTML_FILE.parent.mkdir(parents=True, exist_ok=True)
-    HTML_FILE.write_text(build_html(payload, target_table), encoding="utf-8")
+    HTML_FILE.write_text(build_html(payload, source_table), encoding="utf-8")
     print(f"已生成看板 | {HTML_FILE}")
     print(f"周数 {len(payload['weeks'])} | 标签 {len(payload['labels'])} | 模型 {len(payload['models'])}")
+    if payload["funnel"]:
+        print(f"转化周数 {len(payload['funnel']['weeks'])}")
     return 0
 
 
@@ -437,6 +515,22 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <svg class="chart" id="count-chart" role="img" tabindex="0"></svg>
       <div class="empty-state" id="count-empty" hidden>当前筛选下暂无样本数据</div>
     </div>
+  </section>
+
+  <section class="card" id="funnel-card" hidden>
+    <div class="card-head">
+      <h2>转化率（按申请周 · 老客）</h2>
+      <span class="hint">完成率 = 完成/申请；通过率 = 通过/完成；成交率 = 成交/通过；成交 = Active_Account / Closed / Blocked</span>
+    </div>
+    <div class="legend" id="funnel-legend"></div>
+    <div class="chart-box">
+      <svg class="chart" id="funnel-chart" role="img" tabindex="0"></svg>
+      <div class="empty-state" id="funnel-empty" hidden>当前筛选下暂无转化数据</div>
+    </div>
+    <details class="table-view">
+      <summary>表格视图</summary>
+      <div class="table-scroll" id="funnel-table"></div>
+    </details>
   </section>
 
   <p class="note">
@@ -1156,6 +1250,206 @@ function renderTable(weeks) {
   }
 }
 
+const FUNNEL_SERIES = [
+  { key: 'completion', name: '完成率', colorVar: '--series-1' },
+  { key: 'approval', name: '通过率', colorVar: '--series-2' },
+  { key: 'deal', name: '成交率', colorVar: '--series-3' },
+];
+
+function funnelRow(week) {
+  return (DATA.funnel && DATA.funnel.rows[week]) || null;
+}
+
+function rateOf(num, den) {
+  return (num === null || num === undefined || den === null || den === undefined || !den)
+    ? null : num / den;
+}
+
+function funnelRates(row) {
+  if (!row) return null;
+  return {
+    completion: rateOf(row.completed, row.apply),
+    approval: rateOf(row.approved, row.completed),
+    deal: rateOf(row.deal, row.approved),
+  };
+}
+
+function visibleFunnelWeeks() {
+  if (!DATA.funnel) return [];
+  return state.range === 'all'
+    ? DATA.funnel.weeks.slice()
+    : DATA.funnel.weeks.slice(-Number(state.range));
+}
+
+function renderFunnel() {
+  const card = $('#funnel-card');
+  if (!DATA.funnel || !DATA.funnel.weeks.length) {
+    card.hidden = true;
+    return;
+  }
+  card.hidden = false;
+  const weeks = visibleFunnelWeeks();
+  renderFunnelLegend();
+  renderFunnelChart(weeks);
+  renderFunnelTable(weeks);
+}
+
+function renderFunnelLegend() {
+  const box = $('#funnel-legend');
+  box.textContent = '';
+  FUNNEL_SERIES.forEach((series) => {
+    const item = document.createElement('span');
+    item.className = 'item';
+    const key = document.createElement('span');
+    key.className = 'key-line';
+    key.style.borderTopColor = cssVar(series.colorVar);
+    item.appendChild(key);
+    item.appendChild(document.createTextNode(series.name));
+    box.appendChild(item);
+  });
+}
+
+function renderFunnelChart(weeks) {
+  const svg = $('#funnel-chart');
+  const empty = $('#funnel-empty');
+  clearSvg(svg);
+  svg.setAttribute('viewBox', `0 0 ${SVG_W} ${AUC_H}`);
+
+  const series = FUNNEL_SERIES.map((item) => ({
+    ...item,
+    color: cssVar(item.colorVar),
+    points: weeks.map((week, i) => {
+      const rates = funnelRates(funnelRow(week));
+      return rates && rates[item.key] !== null ? { i, v: rates[item.key] } : null;
+    }),
+  }));
+  const hasData = series.some((item) => item.points.some(Boolean));
+  if (!weeks.length || !hasData) {
+    svg.style.display = 'none';
+    empty.hidden = false;
+    return;
+  }
+  svg.style.display = 'block';
+  empty.hidden = true;
+
+  const yMin = 0;
+  const yMax = 1;
+  const plot = { left: M.left, top: M.top, width: SVG_W - M.left - M.right, height: AUC_H - M.top - M.bottom };
+  plot.y = (v) => plot.top + (yMax - v) / (yMax - yMin) * plot.height;
+  const xOf = (i) => plot.left + (i + 0.5) * plot.width / weeks.length;
+
+  const ticks = [0, 0.25, 0.5, 0.75, 1].map((v) => ({ value: v }));
+  drawYAxis(svg, plot, ticks, (v) => Math.round(v * 100) + '%');
+  drawXAxis(svg, plot, weeks, xOf, AUC_H);
+
+  series.forEach((item) => {
+    let d = '';
+    let open = false;
+    item.points.forEach((p) => {
+      if (!p) { open = false; return; }
+      d += (open ? 'L' : 'M') + xOf(p.i) + ',' + plot.y(p.v) + ' ';
+      open = true;
+    });
+    if (d) {
+      svgEl('path', {
+        d, fill: 'none', stroke: item.color, 'stroke-width': 2,
+        'stroke-linejoin': 'round', 'stroke-linecap': 'round',
+      }, svg);
+    }
+  });
+
+  series.forEach((item) => {
+    const last = item.points.filter(Boolean).pop();
+    if (!last) return;
+    svgEl('circle', {
+      cx: xOf(last.i), cy: plot.y(last.v), r: 4, fill: item.color,
+      stroke: cssVar('--surface'), 'stroke-width': 2,
+    }, svg);
+  });
+
+  const crosshair = svgEl('line', {
+    y1: plot.top, y2: plot.top + plot.height, stroke: cssVar('--axis'),
+    'stroke-width': 1, visibility: 'hidden',
+  }, svg);
+
+  const pct = (v) => (v === null ? '—' : (v * 100).toFixed(1) + '%');
+  attachCrosshair(svg, SVG_W, plot.left, plot.width, weeks, {
+    show(index, clientX, clientY) {
+      const x = xOf(index);
+      crosshair.setAttribute('x1', x);
+      crosshair.setAttribute('x2', x);
+      crosshair.setAttribute('visibility', 'visible');
+      showTooltip((tip) => {
+        const head = document.createElement('div');
+        head.className = 'tt-week';
+        head.textContent = weeks[index];
+        tip.appendChild(head);
+        const row = funnelRow(weeks[index]);
+        const rates = funnelRates(row);
+        FUNNEL_SERIES.forEach((item) => {
+          addTooltipRow(tip, cssVar(item.colorVar), item.name, pct(rates ? rates[item.key] : null));
+        });
+        if (row) {
+          addTooltipRow(tip, null, '申请量', fmtInt.format(row.apply != null ? row.apply : 0));
+          addTooltipRow(tip, null, '完成/通过/成交',
+            `${fmtInt.format(row.completed || 0)} / ${fmtInt.format(row.approved || 0)} / ${fmtInt.format(row.deal || 0)}`);
+        }
+      }, clientX, clientY);
+    },
+    showAt(index) {
+      const svgRect = svg.getBoundingClientRect();
+      const scale = svgRect.width / SVG_W;
+      return { x: svgRect.left + xOf(index) * scale, y: svgRect.top + plot.top + plot.height / 2 };
+    },
+    hide() {
+      crosshair.setAttribute('visibility', 'hidden');
+      hideTooltip();
+    },
+  });
+}
+
+function renderFunnelTable(weeks) {
+  const box = $('#funnel-table');
+  box.textContent = '';
+  const table = document.createElement('table');
+  const thead = document.createElement('thead');
+  const headRow = document.createElement('tr');
+  ['周', '申请量', '完成', '通过', '成交', '完成率', '通过率', '成交率', '自动占比'].forEach((text) => {
+    const th = document.createElement('th');
+    th.textContent = text;
+    headRow.appendChild(th);
+  });
+  thead.appendChild(headRow);
+  table.appendChild(thead);
+
+  const tbody = document.createElement('tbody');
+  weeks.slice().reverse().forEach((week) => {
+    const row = funnelRow(week);
+    const rates = funnelRates(row);
+    const percent = (value) => (value === null || value === undefined) ? '—' : (value * 100).toFixed(1) + '%';
+    const cells = [
+      week,
+      row && row.apply != null ? fmtInt.format(row.apply) : '—',
+      row && row.completed != null ? fmtInt.format(row.completed) : '—',
+      row && row.approved != null ? fmtInt.format(row.approved) : '—',
+      row && row.deal != null ? fmtInt.format(row.deal) : '—',
+      percent(rates ? rates.completion : null),
+      percent(rates ? rates.approval : null),
+      percent(rates ? rates.deal : null),
+      row && row.auto != null && row.approved ? (row.auto / row.approved * 100).toFixed(1) + '%' : '—',
+    ];
+    const tr = document.createElement('tr');
+    cells.forEach((text) => {
+      const td = document.createElement('td');
+      td.textContent = text;
+      tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  box.appendChild(table);
+}
+
 function renderAll() {
   $('#meta-source').textContent = DATA.source ? '数据表 ' + DATA.source : '';
   $('#meta-generated').textContent = '生成于 ' + DATA.generatedAt;
@@ -1165,6 +1459,7 @@ function renderAll() {
   renderAucChart(weeks);
   renderCountChart(weeks);
   renderTable(weeks);
+  renderFunnel();
 }
 
 $('#range-select').addEventListener('change', (event) => {

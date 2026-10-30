@@ -216,3 +216,67 @@ LEFT JOIN auc_agg a
     AND c.label_name  = a.label_name
     AND c.model_name  = a.model_name
 ;
+
+-- =====================================================================
+-- 老客转化漏斗（按申请周，仅 user_tag = Existing）
+-- 完成率 = 完成 / 申请；通过率 = 通过 / 完成；成交率 = 成交 / 通过
+-- 成交口径：status ∈ Active_Account / Closed / Blocked
+-- 自动/人工通过：assessment_status 含 Auto Approved / Manual Approved
+-- =====================================================================
+
+DROP TABLE IF EXISTS model.tmp_eliam_risk_000004_strategy_weekly_funnel;
+
+CREATE TABLE model.tmp_eliam_risk_000004_strategy_weekly_funnel AS
+WITH apps AS (
+    SELECT
+        CAST(cp.application_week AS STRING) AS time_key,
+
+        CASE
+            WHEN cp.application_status IS NULL
+              OR cp.application_status IN ('0.Incomplete', '1.In Progress')
+            THEN 0 ELSE 1
+        END AS completed_flag,
+
+        CASE
+            WHEN LEFT(cp.application_status, 1) IN ('3', '4') THEN 1 ELSE 0
+        END AS approved_flag,
+
+        CASE
+            WHEN LEFT(cp.application_status, 1) IN ('3', '4')
+             AND cp.assessment_status LIKE '%Auto Approved%'
+            THEN 1 ELSE 0
+        END AS auto_approved_flag,
+
+        CASE
+            WHEN LEFT(cp.application_status, 1) IN ('3', '4')
+             AND cp.assessment_status LIKE '%Manual Approved%'
+            THEN 1 ELSE 0
+        END AS manual_approved_flag,
+
+        CASE
+            WHEN cp.status IN ('Active_Account', 'Closed', 'Blocked') THEN 1 ELSE 0
+        END AS deal_flag,
+
+        CASE
+            WHEN cp.application_status = '4.Funded' THEN 1 ELSE 0
+        END AS funded_flag
+
+    FROM model.tmp_eliam_risk_000004_strategy_run_log_v3 r
+    LEFT JOIN ba.customer_profile_rawdata cp
+        ON r.application_id = cp.application_id
+    WHERE r.app_order_desc = 1
+      AND cp.user_tag = 'Existing'
+)
+SELECT
+    time_key,
+    COUNT(*) AS application_cnt,
+    SUM(completed_flag) AS completed_cnt,
+    SUM(approved_flag) AS approved_cnt,
+    SUM(auto_approved_flag) AS auto_approved_cnt,
+    SUM(manual_approved_flag) AS manual_approved_cnt,
+    SUM(deal_flag) AS deal_cnt,
+    SUM(funded_flag) AS funded_cnt
+FROM apps
+WHERE time_key IS NOT NULL
+GROUP BY time_key
+;
