@@ -1,23 +1,28 @@
 -- =====================================================================
--- 1.1 老客模型 by 周 AUC 监控
+-- 老客模型 by 周 AUC 监控（1.1 vs 1.2）
 -- 数据源：model.tmp_eliam_risk_000004_strategy_run_log_v3
 --   * 每个 application 取最新一次 run（app_order_desc = 1）
 --   * 周口径：放款周 cp.dispersal_week，未放款归入 UNFUNDED
 -- 标签：FPD7 + 首期 5+/30+、2 期 30+、3 期 30+
--- 监控分：submodel / mltmodel / appmodel（v1.1）
+-- 监控分（5 标签 × 6 分 = STACK 30 行）：
+--   v1.1：submodel / mltmodel / appmodel
+--   v1.2：submodel / mltmodel / appmodel
 -- =====================================================================
 
-DROP TABLE IF EXISTS model.tmp_eliam_risk_000004_strategy_monitor_auc_v1_1;
+DROP TABLE IF EXISTS model.tmp_eliam_risk_000004_strategy_weekly_auc;
 
-CREATE TABLE model.tmp_eliam_risk_000004_strategy_monitor_auc_v1_1 AS
+CREATE TABLE model.tmp_eliam_risk_000004_strategy_weekly_auc AS
 WITH base AS (
     SELECT
         r.application_id,
         COALESCE(cp.dispersal_week, 'UNFUNDED') AS time_key,
 
         r.old_risk_bid_submodel_250909_txn,
+        r.aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score,
         r.old_risk_bid_mltmodel_v1_1_20251021,
+        r.old_risk_bid_mltmodel_v1_2_20260325,
         r.old_risk_bid_appmodel_v1_1_20250911,
+        r.aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score,
 
         CASE
             WHEN cp.application_status = '4.Funded'
@@ -53,27 +58,42 @@ long AS (
         label_value
     FROM base
     LATERAL VIEW STACK (
-        15,
+        30,
 
-        'fpd7_flag','submodel',old_risk_bid_submodel_250909_txn,fpd7_flag,
-        'fpd7_flag','mltmodel',old_risk_bid_mltmodel_v1_1_20251021,fpd7_flag,
-        'fpd7_flag','appmodel',old_risk_bid_appmodel_v1_1_20250911,fpd7_flag,
+        'fpd7_flag','old_risk_bid_submodel_250909_txn',old_risk_bid_submodel_250909_txn,fpd7_flag,
+        'fpd7_flag','aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score',aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score,fpd7_flag,
+        'fpd7_flag','old_risk_bid_mltmodel_v1_1_20251021',old_risk_bid_mltmodel_v1_1_20251021,fpd7_flag,
+        'fpd7_flag','old_risk_bid_mltmodel_v1_2_20260325',old_risk_bid_mltmodel_v1_2_20260325,fpd7_flag,
+        'fpd7_flag','old_risk_bid_appmodel_v1_1_20250911',old_risk_bid_appmodel_v1_1_20250911,fpd7_flag,
+        'fpd7_flag','aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score',aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score,fpd7_flag,
 
-        'duedate_1m_5','submodel',old_risk_bid_submodel_250909_txn,duedate_1m_5,
-        'duedate_1m_5','mltmodel',old_risk_bid_mltmodel_v1_1_20251021,duedate_1m_5,
-        'duedate_1m_5','appmodel',old_risk_bid_appmodel_v1_1_20250911,duedate_1m_5,
+        'duedate_1m_5','old_risk_bid_submodel_250909_txn',old_risk_bid_submodel_250909_txn,duedate_1m_5,
+        'duedate_1m_5','aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score',aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score,duedate_1m_5,
+        'duedate_1m_5','old_risk_bid_mltmodel_v1_1_20251021',old_risk_bid_mltmodel_v1_1_20251021,duedate_1m_5,
+        'duedate_1m_5','old_risk_bid_mltmodel_v1_2_20260325',old_risk_bid_mltmodel_v1_2_20260325,duedate_1m_5,
+        'duedate_1m_5','old_risk_bid_appmodel_v1_1_20250911',old_risk_bid_appmodel_v1_1_20250911,duedate_1m_5,
+        'duedate_1m_5','aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score',aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score,duedate_1m_5,
 
-        'duedate_1m_30','submodel',old_risk_bid_submodel_250909_txn,duedate_1m_30,
-        'duedate_1m_30','mltmodel',old_risk_bid_mltmodel_v1_1_20251021,duedate_1m_30,
-        'duedate_1m_30','appmodel',old_risk_bid_appmodel_v1_1_20250911,duedate_1m_30,
+        'duedate_1m_30','old_risk_bid_submodel_250909_txn',old_risk_bid_submodel_250909_txn,duedate_1m_30,
+        'duedate_1m_30','aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score',aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score,duedate_1m_30,
+        'duedate_1m_30','old_risk_bid_mltmodel_v1_1_20251021',old_risk_bid_mltmodel_v1_1_20251021,duedate_1m_30,
+        'duedate_1m_30','old_risk_bid_mltmodel_v1_2_20260325',old_risk_bid_mltmodel_v1_2_20260325,duedate_1m_30,
+        'duedate_1m_30','old_risk_bid_appmodel_v1_1_20250911',old_risk_bid_appmodel_v1_1_20250911,duedate_1m_30,
+        'duedate_1m_30','aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score',aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score,duedate_1m_30,
 
-        'duedate_2m_30','submodel',old_risk_bid_submodel_250909_txn,duedate_2m_30,
-        'duedate_2m_30','mltmodel',old_risk_bid_mltmodel_v1_1_20251021,duedate_2m_30,
-        'duedate_2m_30','appmodel',old_risk_bid_appmodel_v1_1_20250911,duedate_2m_30,
+        'duedate_2m_30','old_risk_bid_submodel_250909_txn',old_risk_bid_submodel_250909_txn,duedate_2m_30,
+        'duedate_2m_30','aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score',aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score,duedate_2m_30,
+        'duedate_2m_30','old_risk_bid_mltmodel_v1_1_20251021',old_risk_bid_mltmodel_v1_1_20251021,duedate_2m_30,
+        'duedate_2m_30','old_risk_bid_mltmodel_v1_2_20260325',old_risk_bid_mltmodel_v1_2_20260325,duedate_2m_30,
+        'duedate_2m_30','old_risk_bid_appmodel_v1_1_20250911',old_risk_bid_appmodel_v1_1_20250911,duedate_2m_30,
+        'duedate_2m_30','aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score',aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score,duedate_2m_30,
 
-        'duedate_3m_30','submodel',old_risk_bid_submodel_250909_txn,duedate_3m_30,
-        'duedate_3m_30','mltmodel',old_risk_bid_mltmodel_v1_1_20251021,duedate_3m_30,
-        'duedate_3m_30','appmodel',old_risk_bid_appmodel_v1_1_20250911,duedate_3m_30
+        'duedate_3m_30','old_risk_bid_submodel_250909_txn',old_risk_bid_submodel_250909_txn,duedate_3m_30,
+        'duedate_3m_30','aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score',aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score,duedate_3m_30,
+        'duedate_3m_30','old_risk_bid_mltmodel_v1_1_20251021',old_risk_bid_mltmodel_v1_1_20251021,duedate_3m_30,
+        'duedate_3m_30','old_risk_bid_mltmodel_v1_2_20260325',old_risk_bid_mltmodel_v1_2_20260325,duedate_3m_30,
+        'duedate_3m_30','old_risk_bid_appmodel_v1_1_20250911',old_risk_bid_appmodel_v1_1_20250911,duedate_3m_30,
+        'duedate_3m_30','aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score',aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score,duedate_3m_30
     ) AS label_name, model_name, model_score, label_value
 ),
 

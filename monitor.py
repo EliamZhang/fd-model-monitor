@@ -1,4 +1,4 @@
-"""同步 1.1 老客模型周度 AUC，并生成自包含的 HTML 监控看板。
+"""同步老客模型周度 AUC（1.1 / 1.2），并生成自包含的 HTML 监控看板。
 
 用法（线上环境，脚本同目录需有提供 query_to_df(sql) 的 hive_config）：
     python monitor.py
@@ -37,7 +37,6 @@ ZIP_FILE = PROJECT_DIR / "model_monitor_data.zip"
 HTML_FILE = PROJECT_DIR / "model_monitor_dashboard.html"
 BUSINESS_TZ = timezone(timedelta(hours=8))
 
-# 看板中的展示顺序与显示名
 LABELS = [
     ("fpd7_flag", "FPD7"),
     ("duedate_1m_5", "首期 5+"),
@@ -45,10 +44,15 @@ LABELS = [
     ("duedate_2m_30", "2 期 30+"),
     ("duedate_3m_30", "3 期 30+"),
 ]
+
+# (模型分字段, 展示用家族名, 版本)。版本用于 1.1 / 1.2 对比切换。
 MODELS = [
-    ("old_risk_bid_submodel_250909_txn", "submodel 交易"),
-    ("old_risk_bid_mltmodel_v1_1_20251021", "mltmodel 多期"),
-    ("old_risk_bid_appmodel_v1_1_20250911", "appmodel 申请"),
+    ("old_risk_bid_submodel_250909_txn", "submodel 交易", "1.1"),
+    ("aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score", "submodel 交易", "1.2"),
+    ("old_risk_bid_mltmodel_v1_1_20251021", "mltmodel 多期", "1.1"),
+    ("old_risk_bid_mltmodel_v1_2_20260325", "mltmodel 多期", "1.2"),
+    ("old_risk_bid_appmodel_v1_1_20250911", "appmodel 申请", "1.1"),
+    ("aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score", "appmodel 申请", "1.2"),
 ]
 
 _UNFUNDED = "UNFUNDED"
@@ -128,11 +132,12 @@ def build_payload(df):
 
     weeks = sorted(df["time_key"].unique(), key=natural_key)
     label_keys = [key for key, _ in LABELS]
-    model_keys = [key for key, _ in MODELS]
+    model_keys = [key for key, _, _ in MODELS]
     labels = [key for key in label_keys if key in set(df["label_name"])]
     labels += sorted(set(df["label_name"]) - set(labels))
     models = [key for key in model_keys if key in set(df["model_name"])]
     models += sorted(set(df["model_name"]) - set(models))
+    model_meta = {key: (family, version) for key, family, version in MODELS}
 
     def number(value):
         return None if pd.isna(value) else float(value)
@@ -156,7 +161,14 @@ def build_payload(df):
     return {
         "generatedAt": now().isoformat(timespec="seconds"),
         "labels": [{"key": key, "name": dict(LABELS).get(key, key)} for key in labels],
-        "models": [{"key": key, "name": dict(MODELS).get(key, key)} for key in models],
+        "models": [
+            {
+                "key": key,
+                "name": model_meta.get(key, (key, ""))[0],
+                "version": model_meta.get(key, (key, ""))[1],
+            }
+            for key in models
+        ],
         "weeks": weeks,
         "rows": rows,
     }
@@ -207,7 +219,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>1.1 老客模型周度监控</title>
+<title>老客模型周度监控（1.1 / 1.2）</title>
 <style>
   :root {
     color-scheme: light;
@@ -296,7 +308,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .card .hint { color: var(--muted); font-size: 12px; }
   .legend { display: flex; flex-wrap: wrap; gap: 14px; margin: 8px 0 2px; color: var(--ink-2); font-size: 12.5px; }
   .legend .item { display: inline-flex; align-items: center; gap: 6px; }
-  .key-line { width: 16px; height: 2px; border-radius: 1px; display: inline-block; }
+  .key-line { width: 16px; border-top: 2px solid; border-radius: 1px; display: inline-block; flex: none; }
+  .key-line.dashed { border-top-style: dashed; }
 
   .chart-box { position: relative; }
   svg.chart { display: block; width: 100%; height: auto; }
@@ -312,7 +325,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   }
   #tooltip .tt-week { color: var(--ink-2); font-size: 12px; margin-bottom: 4px; }
   #tooltip .tt-row { display: flex; align-items: center; gap: 7px; padding: 1.5px 0; }
-  #tooltip .tt-key { width: 12px; height: 2px; border-radius: 1px; flex: none; }
+  #tooltip .tt-key { width: 12px; border-top: 2px solid; border-radius: 1px; flex: none; }
+  #tooltip .tt-key.dashed { border-top-style: dashed; }
   #tooltip .tt-name { color: var(--ink-2); }
   #tooltip .tt-val { margin-left: auto; color: var(--ink); font-weight: 640; font-variant-numeric: tabular-nums; }
 
@@ -338,7 +352,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <body>
 <div class="wrap">
   <header>
-    <h1>1.1 老客模型周度监控</h1>
+    <h1>老客模型周度监控（1.1 / 1.2）</h1>
     <div class="meta">
       <span id="meta-source"></span>
       <span id="meta-generated"></span>
@@ -348,6 +362,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   <div class="filters" role="toolbar" aria-label="筛选">
     <div class="pills" id="label-pills" role="group" aria-label="标签"></div>
+    <div class="pills" id="version-pills" role="group" aria-label="版本"></div>
     <label class="range">时间范围
       <select id="range-select">
         <option value="12">最近 12 周</option>
@@ -389,7 +404,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   <p class="note">
     口径说明：标签取自 ba.customer_profile_rawdata（FPD7）与 model.tmp_eliam_listing_vintage（首期/2 期/3 期），
-    未放款申请不参与 AUC。最近一周的 FPD7、近 1-3 个月的 30+ 标签尚未成熟，样本量会明显偏低属正常现象。
+    未放款申请不参与 AUC；最近一周的 FPD7、近 1-3 个月的 30+ 标签尚未成熟，样本量会明显偏低属正常现象。
+    v1.2 于 2026-09-23 上线，此前周的 v1.2 分为离线回填（回测口径）；submodel v1.2 在 2026Q1 前覆盖约 68%-81%。
   </p>
 </div>
 
@@ -399,7 +415,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 const DATA = __DATA_JSON__;
 
 const NS = 'http://www.w3.org/2000/svg';
-const state = { label: DATA.labels.length ? DATA.labels[0].key : null, range: '26' };
+const state = { label: DATA.labels.length ? DATA.labels[0].key : null, range: '26', version: 'compare' };
 const SVG_W = 960;
 const AUC_H = 350;
 const COUNT_H = 210;
@@ -428,8 +444,68 @@ function visibleWeeks() {
   return DATA.weeks.slice(-Number(state.range));
 }
 
-function modelColor(index) {
+function familyList() {
+  const families = [];
+  DATA.models.forEach((model) => {
+    if (!families.includes(model.name)) families.push(model.name);
+  });
+  return families;
+}
+
+function modelColor(family) {
+  const index = familyList().indexOf(family);
   return cssVar('--series-' + Math.min(index + 1, 3));
+}
+
+function buildPayloadMaps() {
+  return DATA.models.map((model) => ({
+    ...model,
+    color: modelColor(model.name),
+    dashed: model.version === '1.2',
+    display: model.version ? model.name + ' · ' + model.version : model.name,
+  }));
+}
+
+function visibleModels() {
+  const all = buildPayloadMaps();
+  if (state.version === 'compare') return all;
+  return all.filter((model) => model.version === state.version || model.version === '');
+}
+
+function renderPills() {
+  const box = $('#label-pills');
+  box.textContent = '';
+  DATA.labels.forEach((label) => {
+    const b = document.createElement('button');
+    b.className = 'pill';
+    b.textContent = label.name;
+    b.setAttribute('aria-pressed', String(state.label === label.key));
+    b.addEventListener('click', () => {
+      state.label = label.key;
+      renderPills();
+      renderAll();
+    });
+    box.appendChild(b);
+  });
+}
+
+const VERSION_VIEWS = [['1.1', '1.1'], ['1.2', '1.2'], ['compare', '对比']];
+
+function renderVersionPills() {
+  const box = $('#version-pills');
+  box.textContent = '';
+  VERSION_VIEWS.forEach(([key, name]) => {
+    const b = document.createElement('button');
+    b.className = 'pill';
+    b.textContent = name;
+    b.setAttribute('aria-pressed', String(state.version === key));
+    b.addEventListener('click', () => {
+      state.version = key;
+      renderVersionPills();
+      renderAll();
+    });
+    box.appendChild(b);
+  });
 }
 
 function shortWeek(week) {
@@ -460,27 +536,6 @@ function niceStep(span, target) {
   return step * mag;
 }
 
-function buildPayloadMaps() {
-  return DATA.models.map((m, i) => ({ ...m, color: modelColor(i) }));
-}
-
-function renderPills() {
-  const box = $('#label-pills');
-  box.textContent = '';
-  DATA.labels.forEach((label) => {
-    const b = document.createElement('button');
-    b.className = 'pill';
-    b.textContent = label.name;
-    b.setAttribute('aria-pressed', String(state.label === label.key));
-    b.addEventListener('click', () => {
-      state.label = label.key;
-      renderPills();
-      renderAll();
-    });
-    box.appendChild(b);
-  });
-}
-
 function latestPoint(label, weeks, model, field) {
   for (let i = weeks.length - 1; i >= 0; i--) {
     const c = cell(label, weeks[i], model);
@@ -500,27 +555,78 @@ function previousPoint(label, weeks, model, field, beforeIndex) {
 function renderKpis(weeks) {
   const box = $('.kpis');
   box.textContent = '';
-  const models = buildPayloadMaps();
-  const tiles = models.map((model) => {
-    const latest = latestPoint(state.label, weeks, model.key, 'auc');
-    const prev = latest ? previousPoint(state.label, weeks, model.key, 'auc', latest.index) : null;
-    const row = latest ? cell(state.label, latest.week, model.key) : null;
+  const all = buildPayloadMaps();
+  const families = [];
+  all.forEach((model) => {
+    if (model.version && !families.some((f) => f.name === model.name)) {
+      families.push({
+        name: model.name,
+        color: model.color,
+        v11: all.find((m) => m.name === model.name && m.version === '1.1') || null,
+        v12: all.find((m) => m.name === model.name && m.version === '1.2') || null,
+      });
+    }
+  });
+  const benchmark = all.find((model) => !model.version) || null;
+
+  const tiles = families.map((family) => {
+    const mainModel = state.version === '1.1'
+      ? (family.v11 || family.v12)
+      : (family.v12 || family.v11);
+    if (!mainModel) {
+      return { name: family.name, color: family.color, dashed: false, value: null, delta: null, sub: '暂无成熟样本' };
+    }
+    const latest = latestPoint(state.label, weeks, mainModel.key, 'auc');
+    if (!latest) {
+      return { name: family.name, color: family.color, dashed: false, value: null, delta: null, sub: '暂无成熟样本' };
+    }
+    const row = cell(state.label, latest.week, mainModel.key);
+    const perf = row && row.perf != null ? row.perf : 0;
+    const subBase = `已表现 ${fmtInt.format(perf)} · ${latest.week}`;
+    let delta = null;
+    let sub = subBase;
+    if (state.version === 'compare' && family.v11 && mainModel.key !== family.v11.key) {
+      const other = cell(state.label, latest.week, family.v11.key);
+      if (other && other.auc != null) {
+        delta = latest.value - other.auc;
+        sub = `1.1 ${fmtAuc(other.auc)} · ${subBase}`;
+      }
+    } else {
+      const prev = previousPoint(state.label, weeks, mainModel.key, 'auc', latest.index);
+      delta = prev ? latest.value - prev.value : null;
+    }
     return {
-      name: model.name, color: model.color,
-      value: latest ? fmtAuc(latest.value) : null,
-      delta: latest && prev ? latest.value - prev.value : null,
-      sub: latest
-        ? `已表现 ${fmtInt.format(row && row.perf != null ? row.perf : 0)} · ${latest.week}`
-        : '暂无成熟样本',
+      name: state.version === 'compare' ? family.name : family.name + ' ' + mainModel.version,
+      color: family.color,
+      dashed: state.version === '1.2',
+      value: fmtAuc(latest.value),
+      delta,
+      sub,
     };
   });
 
-  const sampleLatest = latestPoint(state.label, weeks, models.length ? models[0].key : '', 'perf');
-  let sample = { name: '最新周申请量', color: null, value: null, sub: '暂无数据' };
+  if (benchmark) {
+    const latest = latestPoint(state.label, weeks, benchmark.key, 'auc');
+    const row = latest ? cell(state.label, latest.week, benchmark.key) : null;
+    tiles.push({
+      name: benchmark.name,
+      color: benchmark.color,
+      dashed: false,
+      value: latest ? fmtAuc(latest.value) : null,
+      delta: null,
+      sub: latest
+        ? `已表现 ${fmtInt.format(row && row.perf != null ? row.perf : 0)} · ${latest.week}`
+        : '暂无成熟样本',
+    });
+  }
+
+  const sampleModel = all.length ? all[0].key : '';
+  const sampleLatest = latestPoint(state.label, weeks, sampleModel, 'perf');
+  let sample = { name: '最新周申请量', color: null, dashed: false, value: null, sub: '暂无数据' };
   if (sampleLatest) {
-    const row = cell(state.label, sampleLatest.week, models.length ? models[0].key : '');
+    const row = cell(state.label, sampleLatest.week, sampleModel);
     sample = {
-      name: '最新周申请量', color: null,
+      name: '最新周申请量', color: null, dashed: false,
       value: fmtInt.format(row && row.total != null ? row.total : 0),
       sub: `已表现 ${fmtInt.format(row && row.perf != null ? row.perf : 0)} · 坏样本 ${fmtInt.format(row && row.pos != null ? row.pos : 0)} · ${sampleLatest.week}`,
     };
@@ -534,8 +640,8 @@ function renderKpis(weeks) {
     name.className = 'name';
     if (tile.color) {
       const key = document.createElement('span');
-      key.className = 'key-line';
-      key.style.background = tile.color;
+      key.className = 'key-line' + (tile.dashed ? ' dashed' : '');
+      key.style.borderTopColor = tile.color;
       name.appendChild(key);
     }
     name.appendChild(document.createTextNode(tile.name));
@@ -563,14 +669,14 @@ function renderKpis(weeks) {
 function renderLegend() {
   const box = $('#auc-legend');
   box.textContent = '';
-  buildPayloadMaps().forEach((model) => {
+  visibleModels().forEach((model) => {
     const item = document.createElement('span');
     item.className = 'item';
     const key = document.createElement('span');
-    key.className = 'key-line';
-    key.style.background = model.color;
+    key.className = 'key-line' + (model.dashed ? ' dashed' : '');
+    key.style.borderTopColor = model.color;
     item.appendChild(key);
-    item.appendChild(document.createTextNode(model.name));
+    item.appendChild(document.createTextNode(model.display));
     box.appendChild(item);
   });
 }
@@ -596,13 +702,13 @@ function showTooltip(build, clientX, clientY) {
   tip.style.top = y + 'px';
 }
 
-function addTooltipRow(tip, color, name, value) {
+function addTooltipRow(tip, color, name, value, dashed = false) {
   const row = document.createElement('div');
   row.className = 'tt-row';
   if (color) {
     const key = document.createElement('span');
-    key.className = 'tt-key';
-    key.style.background = color;
+    key.className = 'tt-key' + (dashed ? ' dashed' : '');
+    key.style.borderTopColor = color;
     row.appendChild(key);
   }
   const label = document.createElement('span');
@@ -699,7 +805,7 @@ function renderAucChart(weeks) {
   clearSvg(svg);
   svg.setAttribute('viewBox', `0 0 ${SVG_W} ${AUC_H}`);
 
-  const models = buildPayloadMaps();
+  const models = visibleModels();
   const values = [];
   weeks.forEach((week) => {
     models.forEach((model) => {
@@ -753,11 +859,13 @@ function renderAucChart(weeks) {
       open = true;
     });
     if (d) {
-      svgEl('path', {
+      const attrs = {
         d,
         fill: 'none', stroke: model.color, 'stroke-width': 2,
         'stroke-linejoin': 'round', 'stroke-linecap': 'round',
-      }, svg);
+      };
+      if (model.dashed) attrs['stroke-dasharray'] = '6 4';
+      svgEl('path', attrs, svg);
     }
   });
 
@@ -801,7 +909,7 @@ function renderAucChart(weeks) {
         tip.appendChild(head);
         models.forEach((model) => {
           const c = cell(state.label, weeks[index], model.key);
-          addTooltipRow(tip, model.color, model.name, c ? fmtAuc(c.auc) : '—');
+          addTooltipRow(tip, model.color, model.display, c ? fmtAuc(c.auc) : '—', model.dashed);
         });
         let perf = null;
         models.forEach((model) => {
@@ -929,13 +1037,13 @@ function renderCountChart(weeks) {
 function renderTable(weeks) {
   const box = $('#auc-table');
   box.textContent = '';
-  const models = buildPayloadMaps();
+  const models = visibleModels();
   const table = document.createElement('table');
 
   const thead = document.createElement('thead');
   const headRow = document.createElement('tr');
   ['周'].forEach((t) => { const th = document.createElement('th'); th.textContent = t; headRow.appendChild(th); });
-  models.forEach((model) => { const th = document.createElement('th'); th.textContent = model.name; headRow.appendChild(th); });
+  models.forEach((model) => { const th = document.createElement('th'); th.textContent = model.display; headRow.appendChild(th); });
   ['已表现', '坏样本', '坏率'].forEach((t) => { const th = document.createElement('th'); th.textContent = t; headRow.appendChild(th); });
   thead.appendChild(headRow);
   table.appendChild(thead);
@@ -989,6 +1097,7 @@ $('#range-select').addEventListener('change', (event) => {
 });
 
 renderPills();
+renderVersionPills();
 renderAll();
 
 if (window.matchMedia) {
