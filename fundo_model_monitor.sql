@@ -15,16 +15,16 @@ CREATE TABLE model.tmp_eliam_risk_000004_strategy_weekly_auc AS
 WITH base AS (
     SELECT
         r.application_id,
-        COALESCE(cp.dispersal_week, 'UNFUNDED') AS time_key,
+        COALESCE(CAST(cp.dispersal_week AS STRING), 'UNFUNDED') AS time_key,
 
-        r.old_risk_bid_submodel_250909_txn,
-        r.aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score,
-        r.old_risk_bid_mltmodel_v1_1_20251021,
-        r.old_risk_bid_mltmodel_v1_2_20260325,
-        r.old_risk_bid_appmodel_v1_1_20250911,
-        r.aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score,
+        CAST(r.old_risk_bid_submodel_250909_txn AS DOUBLE) AS old_risk_bid_submodel_250909_txn,
+        CAST(r.aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score AS DOUBLE) AS aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score,
+        CAST(r.old_risk_bid_mltmodel_v1_1_20251021 AS DOUBLE) AS old_risk_bid_mltmodel_v1_1_20251021,
+        CAST(r.old_risk_bid_mltmodel_v1_2_20260325 AS DOUBLE) AS old_risk_bid_mltmodel_v1_2_20260325,
+        CAST(r.old_risk_bid_appmodel_v1_1_20250911 AS DOUBLE) AS old_risk_bid_appmodel_v1_1_20250911,
+        CAST(r.aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score AS DOUBLE) AS aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score,
 
-        CASE
+        CAST(CASE
             WHEN cp.application_status = '4.Funded'
              AND cp.first_payment_scheduled_date < CURRENT_DATE() - 7
              AND cp.first_payment_days_past_due_ever > 7
@@ -33,12 +33,12 @@ WITH base AS (
              AND cp.first_payment_scheduled_date < CURRENT_DATE() - 7
             THEN 0
             ELSE NULL
-        END AS fpd7_flag,
+        END AS INT) AS fpd7_flag,
 
-        lv.duedate_1m_5,
-        lv.duedate_1m_30,
-        lv.duedate_2m_30,
-        lv.duedate_3m_30
+        CAST(lv.duedate_1m_5 AS INT) AS duedate_1m_5,
+        CAST(lv.duedate_1m_30 AS INT) AS duedate_1m_30,
+        CAST(lv.duedate_2m_30 AS INT) AS duedate_2m_30,
+        CAST(lv.duedate_3m_30 AS INT) AS duedate_3m_30
     FROM model.tmp_eliam_risk_000004_strategy_run_log_v3 r
     LEFT JOIN ba.customer_profile_rawdata cp
         ON r.application_id = cp.application_id
