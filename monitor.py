@@ -401,6 +401,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     --bin-3: #2a78d6;
     --bin-4: #1c5cab;
     --bin-5: #104281;
+    --seq-0: #cde2fb;
+    --seq-1: #86b6ef;
+    --seq-2: #3987e5;
+    --seq-3: #1c5cab;
+    --seq-4: #0d366b;
     --good: #006300;
     --bad: #d03b3b;
     --wash: rgba(11, 11, 11, 0.04);
@@ -425,6 +430,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       --bin-3: #3987e5;
       --bin-4: #256abf;
       --bin-5: #184f95;
+      --seq-0: #184f95;
+      --seq-1: #256abf;
+      --seq-2: #3987e5;
+      --seq-3: #9ec5f4;
+      --seq-4: #cde2fb;
       --good: #0ca30c;
       --bad: #e66767;
       --wash: rgba(255, 255, 255, 0.05);
@@ -520,6 +530,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   details.table-view[open] summary::before { transform: rotate(90deg); }
   .table-scroll { overflow-x: auto; padding-bottom: 10px; }
   .table-note { color: var(--muted); font-size: 11.5px; margin: 0 0 10px; }
+  .scale-legend { display: flex; align-items: center; gap: 8px; margin: 6px 0 8px; color: var(--muted); font-size: 11.5px; }
+  .scale-bar { width: 140px; height: 8px; border-radius: 4px; display: inline-block; }
   table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
   th, td { text-align: right; padding: 6px 10px; white-space: nowrap; }
   th { color: var(--muted); font-weight: 500; border-bottom: 1px solid var(--grid); }
@@ -605,10 +617,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <section class="card" id="bin-card" hidden>
     <div class="card-head">
       <h2>分箱坏账率（按放款周）</h2>
-      <span class="hint" id="bin-hint">箱 1 分数最低（最好）→ 箱 5 最差；数值 = 坏样本 / 已表现样本</span>
+      <span class="hint" id="bin-hint">行为周（新 → 旧），列为箱 1-5；颜色越深坏账率越高</span>
     </div>
-    <div class="legend" id="bin-legend"></div>
     <h3 class="sub-title">FPD7</h3>
+    <div class="scale-legend" id="bin-scale-fpd7"></div>
     <div class="chart-box">
       <svg class="chart" id="bin-chart-fpd7" role="img" tabindex="0"></svg>
       <div class="empty-state" id="bin-empty-fpd7" hidden>当前筛选下暂无分箱数据</div>
@@ -618,6 +630,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <div class="table-scroll" id="bin-table-fpd7"></div>
     </details>
     <h3 class="sub-title">首期 30+</h3>
+    <div class="scale-legend" id="bin-scale-1m30"></div>
     <div class="chart-box">
       <svg class="chart" id="bin-chart-1m30" role="img" tabindex="0"></svg>
       <div class="empty-state" id="bin-empty-1m30" hidden>当前筛选下暂无分箱数据</div>
@@ -646,7 +659,6 @@ const state = { label: DATA.labels.length ? DATA.labels[0].key : null, range: '2
 const SVG_W = 960;
 const AUC_H = 350;
 const COUNT_H = 210;
-const BIN_H = 260;
 const M = { top: 18, right: 16, bottom: 30, left: 56 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -1602,140 +1614,204 @@ function renderBins() {
     return;
   }
   card.hidden = false;
-  const legend = $('#bin-legend');
-  legend.textContent = '';
-  for (let bin = 1; bin <= 5; bin++) {
-    const item = document.createElement('span');
-    item.className = 'item';
-    const key = document.createElement('span');
-    key.className = 'key-line';
-    key.style.borderTopColor = cssVar('--bin-' + bin);
-    item.appendChild(key);
-    item.appendChild(document.createTextNode('箱 ' + bin));
-    legend.appendChild(item);
-  }
   const limits = ((DATA.bins.thresholds) || {})[state.binModel];
-  $('#bin-hint').textContent = limits && limits.length === 4
-    ? '箱 1-4 上限：' + limits.map((value) => value.toFixed(4)).join(' / ')
-      + '；箱 5 为以上。数值 = 坏样本 / 已表现样本'
-    : '箱 1 分数最低（最好）→ 箱 5 最差；数值 = 坏样本 / 已表现样本';
-  renderBinChart('fpd7_flag', 'fpd7');
-  renderBinChart('duedate_1m_30', '1m30');
+  $('#bin-hint').textContent = (limits && limits.length === 4
+    ? '箱 1-4 上限：' + limits.map((value) => value.toFixed(4)).join(' / ') + '；箱 5 为以上。'
+    : '') + '行为周（新 → 旧），列为分箱；颜色越深坏账率越高';
+  renderBinHeatmap('fpd7_flag', 'fpd7');
+  renderBinHeatmap('duedate_1m_30', '1m30');
 }
 
-function renderBinChart(label, suffix) {
+const SEQ_STOPS = ['--seq-0', '--seq-1', '--seq-2', '--seq-3', '--seq-4'];
+
+function hexToRgb(hex) {
+  const value = hex.replace('#', '');
+  const full = value.length === 3 ? value.split('').map((c) => c + c).join('') : value;
+  return [parseInt(full.slice(0, 2), 16), parseInt(full.slice(2, 4), 16), parseInt(full.slice(4, 6), 16)];
+}
+
+function seqFill(t) {
+  const stops = SEQ_STOPS.map((name) => hexToRgb(cssVar(name)));
+  const pos = Math.min(Math.max(t, 0), 0.9999) * (stops.length - 1);
+  const index = Math.min(Math.floor(pos), stops.length - 2);
+  const f = pos - index;
+  const mix = (i) => Math.round(stops[index][i] + (stops[index + 1][i] - stops[index][i]) * f);
+  return 'rgb(' + mix(0) + ',' + mix(1) + ',' + mix(2) + ')';
+}
+
+function textOnFill(fill) {
+  const match = /rgb\((\d+),(\d+),(\d+)\)/.exec(fill);
+  if (!match) return '#0b0b0b';
+  const channel = (value) => {
+    const c = Number(value) / 255;
+    return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+  };
+  const lum = 0.2126 * channel(match[1]) + 0.7152 * channel(match[2]) + 0.0722 * channel(match[3]);
+  return lum > 0.45 ? '#0b0b0b' : '#ffffff';
+}
+
+function showCellTip(clientX, clientY, week, bin, rate, perf, modelName, fill) {
+  showTooltip((tip) => {
+    const head = document.createElement('div');
+    head.className = 'tt-week';
+    head.textContent = week + (modelName ? ' · ' + modelName : '');
+    tip.appendChild(head);
+    const interval = binIntervalText(state.binModel, bin);
+    addTooltipRow(
+      tip,
+      fill,
+      '箱 ' + bin + (interval ? ' (' + interval + ')' : ''),
+      (rate * 100).toFixed(1) + '% · n ' + fmtInt.format(perf)
+    );
+  }, clientX, clientY);
+}
+
+function renderBinHeatmap(label, suffix) {
   const svg = $('#bin-chart-' + suffix);
   const empty = $('#bin-empty-' + suffix);
+  const scaleBox = $('#bin-scale-' + suffix);
   clearSvg(svg);
-  svg.setAttribute('viewBox', `0 0 ${SVG_W} ${BIN_H}`);
+  scaleBox.textContent = '';
 
-  const weeks = visibleBinWeeks();
+  const allWeeks = visibleBinWeeks();
+  const weeks = allWeeks.slice().reverse();
   const model = state.binModel;
   const modelMeta = buildPayloadMaps().find((item) => item.key === model);
   const modelName = modelMeta ? modelMeta.display : (model || '');
 
-  const series = [];
-  for (let bin = 1; bin <= 5; bin++) {
-    series.push({
-      bin,
-      color: cssVar('--bin-' + bin),
-      points: weeks.map((week, i) => {
-        const point = binPoint(label, week, model, bin);
-        if (!point || !point.perf) return null;
-        return { i, v: point.pos / point.perf, perf: point.perf, pos: point.pos };
-      }),
-    });
-  }
-  const values = [];
-  series.forEach((item) => item.points.forEach((point) => { if (point) values.push(point.v); }));
-  if (!weeks.length || !values.length) {
+  let maxRate = 0;
+  weeks.forEach((week) => {
+    for (let bin = 1; bin <= 5; bin++) {
+      const point = binPoint(label, week, model, bin);
+      if (point && point.perf) maxRate = Math.max(maxRate, point.pos / point.perf);
+    }
+  });
+  if (!weeks.length || !maxRate) {
     svg.style.display = 'none';
     empty.hidden = false;
-    renderBinTable(label, suffix, weeks, model);
+    renderBinTable(label, suffix, allWeeks, model);
     return;
   }
   svg.style.display = 'block';
   empty.hidden = true;
 
-  const dataMax = Math.max(...values);
-  const step = niceStep(Math.max(dataMax, 0.02), 4);
-  const top = Math.ceil(dataMax / step) * step;
-  const plot = { left: M.left, top: M.top, width: SVG_W - M.left - M.right, height: BIN_H - M.top - M.bottom };
-  plot.y = (v) => plot.top + (1 - v / top) * plot.height;
-  const xOf = (i) => plot.left + (i + 0.5) * plot.width / weeks.length;
+  const step = niceStep(Math.max(maxRate, 0.02), 4);
+  const top = Math.ceil(maxRate / step) * step;
+  const rows = weeks.length;
+  const cellH = Math.max(14, Math.min(22, Math.floor(560 / rows)));
+  const plot = { left: M.left, top: M.top, width: SVG_W - M.left - M.right };
+  const cellW = plot.width / 5;
+  svg.setAttribute('viewBox', `0 0 ${SVG_W} ${plot.top + rows * cellH + 28}`);
 
-  const ticks = [];
-  for (let v = 0; v <= top + 1e-9; v += step) ticks.push({ value: Number(v.toFixed(4)) });
-  drawYAxis(svg, plot, ticks, (v) => {
-    const pct = v * 100;
-    return (Number.isInteger(pct) ? pct.toFixed(0) : pct.toFixed(1)) + '%';
+  const labelStep = rows <= 30 ? 1 : Math.ceil(rows / 26);
+  weeks.forEach((week, r) => {
+    if (r % labelStep !== 0) return;
+    const text = svgEl('text', {
+      x: plot.left - 8, y: plot.top + r * cellH + cellH / 2 + 3.5,
+      'text-anchor': 'end', 'font-size': 10.5, fill: cssVar('--muted'),
+      'font-variant-numeric': 'tabular-nums',
+    }, svg);
+    text.textContent = shortWeek(week);
   });
-  drawXAxis(svg, plot, weeks, xOf, BIN_H);
 
-  series.forEach((item) => {
-    let d = '';
-    let open = false;
-    item.points.forEach((point) => {
-      if (!point) { open = false; return; }
-      d += (open ? 'L' : 'M') + xOf(point.i) + ',' + plot.y(point.v) + ' ';
-      open = true;
-    });
-    if (d) {
-      svgEl('path', {
-        d, fill: 'none', stroke: item.color, 'stroke-width': 2,
-        'stroke-linejoin': 'round', 'stroke-linecap': 'round',
+  for (let bin = 1; bin <= 5; bin++) {
+    const text = svgEl('text', {
+      x: plot.left + (bin - 0.5) * cellW, y: plot.top + rows * cellH + 16,
+      'text-anchor': 'middle', 'font-size': 11, fill: cssVar('--muted'),
+    }, svg);
+    text.textContent = '箱 ' + bin;
+  }
+
+  const outline = svgEl('rect', {
+    fill: 'none', stroke: cssVar('--ink'), 'stroke-width': 2, visibility: 'hidden',
+    'pointer-events': 'none',
+  }, svg);
+
+  weeks.forEach((week, r) => {
+    for (let bin = 1; bin <= 5; bin++) {
+      const point = binPoint(label, week, model, bin);
+      if (!point || !point.perf) continue;
+      const rate = point.pos / point.perf;
+      const fill = seqFill(rate / top);
+      const x = plot.left + (bin - 1) * cellW;
+      const y = plot.top + r * cellH;
+      const rect = svgEl('rect', {
+        x: x + 1, y: y + 1, width: cellW - 2, height: cellH - 2, fill,
       }, svg);
+      if (cellH >= 14) {
+        const text = svgEl('text', {
+          x: x + cellW / 2, y: y + cellH / 2 + 3.5,
+          'text-anchor': 'middle', 'font-size': Math.min(11, cellH - 5),
+          fill: textOnFill(fill), 'font-variant-numeric': 'tabular-nums',
+          'pointer-events': 'none',
+        }, svg);
+        text.textContent = (rate * 100).toFixed(1) + '%';
+      }
+      const highlight = () => {
+        outline.setAttribute('x', x + 1);
+        outline.setAttribute('y', y + 1);
+        outline.setAttribute('width', cellW - 2);
+        outline.setAttribute('height', cellH - 2);
+        outline.setAttribute('visibility', 'visible');
+      };
+      rect.addEventListener('pointermove', (event) => {
+        highlight();
+        showCellTip(event.clientX, event.clientY, week, bin, rate, point.perf, modelName, fill);
+      });
+      rect.addEventListener('pointerleave', () => {
+        outline.setAttribute('visibility', 'hidden');
+        hideTooltip();
+      });
     }
   });
 
-  series.forEach((item) => {
-    const last = item.points.filter(Boolean).pop();
-    if (!last) return;
-    svgEl('circle', {
-      cx: xOf(last.i), cy: plot.y(last.v), r: 4, fill: item.color,
-      stroke: cssVar('--surface'), 'stroke-width': 2,
-    }, svg);
-  });
-
-  const crosshair = svgEl('line', {
-    y1: plot.top, y2: plot.top + plot.height, stroke: cssVar('--axis'),
-    'stroke-width': 1, visibility: 'hidden',
-  }, svg);
-
-  attachCrosshair(svg, SVG_W, plot.left, plot.width, weeks, {
-    show(index, clientX, clientY) {
-      const x = xOf(index);
-      crosshair.setAttribute('x1', x);
-      crosshair.setAttribute('x2', x);
-      crosshair.setAttribute('visibility', 'visible');
-      showTooltip((tip) => {
-        const head = document.createElement('div');
-        head.className = 'tt-week';
-        head.textContent = weeks[index] + (modelName ? ' · ' + modelName : '');
-        tip.appendChild(head);
-        series.forEach((item) => {
-          const point = item.points[index];
-          const interval = binIntervalText(model, item.bin);
-          const name = '箱 ' + item.bin + (interval ? ' (' + interval + ')' : '');
-          const value = point
-            ? (point.v * 100).toFixed(1) + '% · n ' + fmtInt.format(point.perf)
-            : '—';
-          addTooltipRow(tip, item.color, name, value);
-        });
-      }, clientX, clientY);
-    },
-    showAt(index) {
-      const svgRect = svg.getBoundingClientRect();
-      const scale = svgRect.width / SVG_W;
-      return { x: svgRect.left + xOf(index) * scale, y: svgRect.top + plot.top + plot.height / 2 };
-    },
-    hide() {
-      crosshair.setAttribute('visibility', 'hidden');
+  let activeRow = 0;
+  let activeCol = 0;
+  const paintActive = (showTip) => {
+    const x = plot.left + activeCol * cellW;
+    const y = plot.top + activeRow * cellH;
+    outline.setAttribute('x', x + 1);
+    outline.setAttribute('y', y + 1);
+    outline.setAttribute('width', cellW - 2);
+    outline.setAttribute('height', cellH - 2);
+    outline.setAttribute('visibility', 'visible');
+    const week = weeks[activeRow];
+    const bin = activeCol + 1;
+    const point = binPoint(label, week, model, bin);
+    if (point && point.perf && showTip) {
+      const rect = svg.getBoundingClientRect();
+      const scale = rect.width / SVG_W;
+      const cx = rect.left + (x + cellW / 2) * scale;
+      const cy = rect.top + (y + cellH / 2) * scale;
+      const rate = point.pos / point.perf;
+      showCellTip(cx, cy, week, bin, rate, point.perf, modelName, seqFill(rate / top));
+    } else {
       hideTooltip();
-    },
-  });
+    }
+  };
+  svg.onfocus = () => paintActive(true);
+  svg.onblur = () => {
+    outline.setAttribute('visibility', 'hidden');
+    hideTooltip();
+  };
+  svg.onkeydown = (event) => {
+    const delta = { ArrowUp: [-1, 0], ArrowDown: [1, 0], ArrowLeft: [0, -1], ArrowRight: [0, 1] }[event.key];
+    if (!delta) return;
+    event.preventDefault();
+    activeRow = Math.min(Math.max(activeRow + delta[0], 0), rows - 1);
+    activeCol = Math.min(Math.max(activeCol + delta[1], 0), 4);
+    paintActive(true);
+  };
 
-  renderBinTable(label, suffix, weeks, model);
+  const bar = document.createElement('span');
+  bar.className = 'scale-bar';
+  bar.style.background = 'linear-gradient(to right, ' + SEQ_STOPS.map((name) => cssVar(name)).join(', ') + ')';
+  const scaleText = document.createElement('span');
+  scaleText.textContent = '坏账率 0% – ' + (top * 100).toFixed(top * 100 < 10 ? 1 : 0) + '%';
+  scaleBox.appendChild(bar);
+  scaleBox.appendChild(scaleText);
+
+  renderBinTable(label, suffix, allWeeks, model);
 }
 
 function renderBinTable(label, suffix, weeks, model) {
