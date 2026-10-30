@@ -17,7 +17,7 @@ import json
 import re
 import sys
 import zipfile
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -81,7 +81,9 @@ def week_start_date(text):
     if not match:
         return None
     try:
-        return date.fromisocalendar(int(match.group(1)), int(match.group(2)), 1).isoformat()
+        return datetime.strptime(
+            f"{int(match.group(1))} {int(match.group(2))} 1", "%G %V %u"
+        ).date().isoformat()
     except ValueError:
         return None
 
