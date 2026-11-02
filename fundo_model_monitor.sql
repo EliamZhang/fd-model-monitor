@@ -1,6 +1,6 @@
 -- =====================================================================
 -- 老客模型 by 周 AUC 监控（1.1 vs 1.2）
--- 数据源：model.tmp_eliam_risk_000004_strategy_run_log_v3
+-- 数据源：model.tmp_eliam_risk_000004_strategy_run_log_v20261102
 --   * 每个 application 取最新一次 run（app_order_desc = 1）
 --   * 周口径：放款周 cp.dispersal_week，未放款归入 UNFUNDED
 -- 标签：FPD7 + 首期 5+/30+、2 期 30+、3 期 30+
@@ -39,7 +39,7 @@ WITH base AS (
         CAST(lv.duedate_1m_30 AS INT) AS duedate_1m_30,
         CAST(lv.duedate_2m_30 AS INT) AS duedate_2m_30,
         CAST(lv.duedate_3m_30 AS INT) AS duedate_3m_30
-    FROM model.tmp_eliam_risk_000004_strategy_run_log_v3 r
+    FROM model.tmp_eliam_risk_000004_strategy_run_log_v20261102 r
     LEFT JOIN ba.customer_profile_rawdata cp
         ON r.application_id = cp.application_id
     LEFT JOIN model.tmp_eliam_listing_vintage lv
@@ -261,7 +261,7 @@ WITH apps AS (
             WHEN cp.application_status = '4.Funded' THEN 1 ELSE 0
         END AS funded_flag
 
-    FROM model.tmp_eliam_risk_000004_strategy_run_log_v3 r
+    FROM model.tmp_eliam_risk_000004_strategy_run_log_v20261102 r
     LEFT JOIN ba.customer_profile_rawdata cp
         ON r.application_id = cp.application_id
     WHERE r.app_order_desc = 1
@@ -362,7 +362,7 @@ WITH base AS (
         END AS INT) AS fpd7_flag,
 
         CAST(lv.duedate_1m_30 AS INT) AS duedate_1m_30
-    FROM model.tmp_eliam_risk_000004_strategy_run_log_v3 r
+    FROM model.tmp_eliam_risk_000004_strategy_run_log_v20261102 r
     LEFT JOIN ba.customer_profile_rawdata cp
         ON r.application_id = cp.application_id
     LEFT JOIN model.tmp_eliam_listing_vintage lv
@@ -476,7 +476,7 @@ WITH base AS (
             ELSE 5
         END AS bin_app_v12
 
-    FROM model.tmp_eliam_risk_000004_strategy_run_log_v3 r
+    FROM model.tmp_eliam_risk_000004_strategy_run_log_v20261102 r
     LEFT JOIN ba.customer_profile_rawdata cp
         ON r.application_id = cp.application_id
     WHERE r.app_order_desc = 1
@@ -598,7 +598,7 @@ WITH base AS (
             WHEN cp.status IN ('Active_Account', 'Closed', 'Blocked') THEN 1 ELSE 0
         END AS deal_flag
 
-    FROM model.tmp_eliam_risk_000004_strategy_run_log_v3 r
+    FROM model.tmp_eliam_risk_000004_strategy_run_log_v20261102 r
     LEFT JOIN ba.customer_profile_rawdata cp
         ON r.application_id = cp.application_id
     WHERE r.app_order_desc = 1
