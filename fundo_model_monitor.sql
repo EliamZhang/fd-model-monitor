@@ -220,6 +220,235 @@ LEFT JOIN auc_agg a
 ;
 
 -- =====================================================================
+-- 老客月度 AUC（MBR 大盘口径）
+-- 与上方周度 AUC 同源同口径，仅时间粒度由周改为月：
+--   月口径 = 放款周（ISO 周）周四所在月，即覆盖该周多数日期的月份
+--   未放款申请（dispersal_week 为空）不参与月度统计
+-- =====================================================================
+
+DROP TABLE IF EXISTS model.tmp_eliam_risk_000004_strategy_monthly_auc;
+
+CREATE TABLE model.tmp_eliam_risk_000004_strategy_monthly_auc AS
+WITH base AS (
+    SELECT
+        CASE
+            WHEN cp.dispersal_week IS NULL THEN NULL
+            ELSE DATE_FORMAT(
+                DATE_ADD(
+                    DATE_SUB(
+                        TO_DATE(CONCAT(SUBSTR(CAST(cp.dispersal_week AS STRING), 1, 4), '-01-04')),
+                        (DAYOFWEEK(TO_DATE(CONCAT(SUBSTR(CAST(cp.dispersal_week AS STRING), 1, 4), '-01-04'))) + 5) % 7
+                    ),
+                    (CAST(SUBSTR(CAST(cp.dispersal_week AS STRING), 6, 2) AS INT) - 1) * 7 + 3
+                ),
+                'yyyy-MM'
+            )
+        END AS time_key,
+        cp.application_id,
+
+        CAST(r.old_risk_bid_submodel_250909_txn AS DOUBLE) AS old_risk_bid_submodel_250909_txn,
+        CAST(r.aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score AS DOUBLE) AS aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score,
+        CAST(r.old_risk_bid_mltmodel_v1_1_20251021 AS DOUBLE) AS old_risk_bid_mltmodel_v1_1_20251021,
+        CAST(r.old_risk_bid_mltmodel_v1_2_20260325 AS DOUBLE) AS old_risk_bid_mltmodel_v1_2_20260325,
+        CAST(r.old_risk_bid_appmodel_v1_1_20250911 AS DOUBLE) AS old_risk_bid_appmodel_v1_1_20250911,
+        CAST(r.aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score AS DOUBLE) AS aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score,
+
+        CAST(CASE
+            WHEN cp.application_status = '4.Funded'
+             AND cp.first_payment_scheduled_date < CURRENT_DATE() - 7
+             AND cp.first_payment_days_past_due_ever > 7
+            THEN 1
+            WHEN cp.application_status = '4.Funded'
+             AND cp.first_payment_scheduled_date < CURRENT_DATE() - 7
+            THEN 0
+            ELSE NULL
+        END AS INT) AS fpd7_flag,
+
+        CAST(lv.duedate_1m_5 AS INT) AS duedate_1m_5,
+        CAST(lv.duedate_1m_30 AS INT) AS duedate_1m_30,
+        CAST(lv.duedate_2m_30 AS INT) AS duedate_2m_30,
+        CAST(lv.duedate_3m_30 AS INT) AS duedate_3m_30
+    FROM ba.customer_profile_rawdata cp
+    LEFT JOIN model.tmp_eliam_risk_000004_strategy_run_log_v20261102 r
+        ON cp.application_id = r.application_id
+       AND r.app_order_desc = 1
+    LEFT JOIN model.tmp_eliam_listing_vintage lv
+        ON cp.application_id = lv.application_id
+    WHERE cp.user_tag = 'Existing'
+      AND cp.dispersal_week IS NOT NULL
+),
+
+-- 标签 × 模型 展开成长表
+long AS (
+    SELECT
+        time_key,
+        application_id,
+        label_name,
+        model_name,
+        model_score,
+        label_value
+    FROM base
+    LATERAL VIEW STACK (
+        30,
+
+        'fpd7_flag','old_risk_bid_submodel_250909_txn',old_risk_bid_submodel_250909_txn,fpd7_flag,
+        'fpd7_flag','aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score',aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score,fpd7_flag,
+        'fpd7_flag','old_risk_bid_mltmodel_v1_1_20251021',old_risk_bid_mltmodel_v1_1_20251021,fpd7_flag,
+        'fpd7_flag','old_risk_bid_mltmodel_v1_2_20260325',old_risk_bid_mltmodel_v1_2_20260325,fpd7_flag,
+        'fpd7_flag','old_risk_bid_appmodel_v1_1_20250911',old_risk_bid_appmodel_v1_1_20250911,fpd7_flag,
+        'fpd7_flag','aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score',aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score,fpd7_flag,
+
+        'duedate_1m_5','old_risk_bid_submodel_250909_txn',old_risk_bid_submodel_250909_txn,duedate_1m_5,
+        'duedate_1m_5','aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score',aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score,duedate_1m_5,
+        'duedate_1m_5','old_risk_bid_mltmodel_v1_1_20251021',old_risk_bid_mltmodel_v1_1_20251021,duedate_1m_5,
+        'duedate_1m_5','old_risk_bid_mltmodel_v1_2_20260325',old_risk_bid_mltmodel_v1_2_20260325,duedate_1m_5,
+        'duedate_1m_5','old_risk_bid_appmodel_v1_1_20250911',old_risk_bid_appmodel_v1_1_20250911,duedate_1m_5,
+        'duedate_1m_5','aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score',aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score,duedate_1m_5,
+
+        'duedate_1m_30','old_risk_bid_submodel_250909_txn',old_risk_bid_submodel_250909_txn,duedate_1m_30,
+        'duedate_1m_30','aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score',aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score,duedate_1m_30,
+        'duedate_1m_30','old_risk_bid_mltmodel_v1_1_20251021',old_risk_bid_mltmodel_v1_1_20251021,duedate_1m_30,
+        'duedate_1m_30','old_risk_bid_mltmodel_v1_2_20260325',old_risk_bid_mltmodel_v1_2_20260325,duedate_1m_30,
+        'duedate_1m_30','old_risk_bid_appmodel_v1_1_20250911',old_risk_bid_appmodel_v1_1_20250911,duedate_1m_30,
+        'duedate_1m_30','aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score',aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score,duedate_1m_30,
+
+        'duedate_2m_30','old_risk_bid_submodel_250909_txn',old_risk_bid_submodel_250909_txn,duedate_2m_30,
+        'duedate_2m_30','aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score',aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score,duedate_2m_30,
+        'duedate_2m_30','old_risk_bid_mltmodel_v1_1_20251021',old_risk_bid_mltmodel_v1_1_20251021,duedate_2m_30,
+        'duedate_2m_30','old_risk_bid_mltmodel_v1_2_20260325',old_risk_bid_mltmodel_v1_2_20260325,duedate_2m_30,
+        'duedate_2m_30','old_risk_bid_appmodel_v1_1_20250911',old_risk_bid_appmodel_v1_1_20250911,duedate_2m_30,
+        'duedate_2m_30','aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score',aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score,duedate_2m_30,
+
+        'duedate_3m_30','old_risk_bid_submodel_250909_txn',old_risk_bid_submodel_250909_txn,duedate_3m_30,
+        'duedate_3m_30','aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score',aus_old_risk_bid_submodel_v20260323_v1_2_txn_lgb_score,duedate_3m_30,
+        'duedate_3m_30','old_risk_bid_mltmodel_v1_1_20251021',old_risk_bid_mltmodel_v1_1_20251021,duedate_3m_30,
+        'duedate_3m_30','old_risk_bid_mltmodel_v1_2_20260325',old_risk_bid_mltmodel_v1_2_20260325,duedate_3m_30,
+        'duedate_3m_30','old_risk_bid_appmodel_v1_1_20250911',old_risk_bid_appmodel_v1_1_20250911,duedate_3m_30,
+        'duedate_3m_30','aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score',aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score,duedate_3m_30
+    ) AS label_name, model_name, model_score, label_value
+),
+
+-- ROC 累计量（仅已表现样本）
+roc_base AS (
+    SELECT
+        time_key,
+        label_name,
+        model_name,
+        application_id,
+        model_score,
+        label_value,
+
+        SUM(label_value) OVER (
+            PARTITION BY time_key, label_name, model_name
+        ) AS tot_y1,
+
+        SUM(1 - label_value) OVER (
+            PARTITION BY time_key, label_name, model_name
+        ) AS tot_y0,
+
+        SUM(label_value) OVER (
+            PARTITION BY time_key, label_name, model_name
+            ORDER BY model_score DESC
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS csum_y1,
+
+        SUM(1 - label_value) OVER (
+            PARTITION BY time_key, label_name, model_name
+            ORDER BY model_score DESC
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS csum_y0
+    FROM long
+    WHERE
+        label_value IN (0,1)
+        AND model_score IS NOT NULL
+),
+
+-- TPR / FPR + 前一节点
+roc_curve AS (
+    SELECT
+        time_key,
+        label_name,
+        model_name,
+
+        csum_y1 / tot_y1 AS tpr,
+        csum_y0 / tot_y0 AS fpr,
+
+        LEAD(csum_y1 / tot_y1) OVER (
+            PARTITION BY time_key, label_name, model_name
+            ORDER BY csum_y1 / tot_y1 DESC
+        ) AS pre_tpr,
+
+        LEAD(csum_y0 / tot_y0) OVER (
+            PARTITION BY time_key, label_name, model_name
+            ORDER BY csum_y0 / tot_y0 DESC
+        ) AS pre_fpr,
+
+        tot_y1,
+        tot_y0
+    FROM roc_base
+),
+
+-- ROC 梯形积分 AUC
+auc_agg AS (
+    SELECT
+        time_key,
+        label_name,
+        model_name,
+
+        MAX(tot_y1) AS pos_cnt,
+        MAX(tot_y0) AS neg_cnt,
+
+        SUM((tpr + pre_tpr) / 2 * (fpr - pre_fpr)) AS auc
+    FROM roc_curve
+    WHERE pre_tpr IS NOT NULL
+      AND pre_fpr IS NOT NULL
+    GROUP BY
+        time_key,
+        label_name,
+        model_name
+),
+
+-- 样本量统计
+cnt_agg AS (
+    SELECT
+        time_key,
+        label_name,
+        model_name,
+
+        COUNT(DISTINCT application_id) AS total_application_cnt,
+        SUM(CASE WHEN label_value IN (0,1) THEN 1 END) AS performance_cnt,
+        SUM(CASE WHEN label_value = 1 THEN 1 END) AS pos_cnt,
+        SUM(CASE WHEN label_value = 0 THEN 1 END) AS neg_cnt,
+        SUM(CASE WHEN label_value IS NULL THEN 1 END) AS unperformance_cnt
+    FROM long
+    GROUP BY
+        time_key,
+        label_name,
+        model_name
+)
+
+SELECT
+    c.time_key,
+    c.label_name,
+    c.model_name,
+
+    c.total_application_cnt,
+    c.performance_cnt,
+    c.pos_cnt,
+    c.neg_cnt,
+    c.unperformance_cnt,
+
+    a.pos_cnt   AS auc_pos_cnt,
+    a.neg_cnt   AS auc_neg_cnt,
+    a.auc
+FROM cnt_agg c
+LEFT JOIN auc_agg a
+    ON  c.time_key    = a.time_key
+    AND c.label_name  = a.label_name
+    AND c.model_name  = a.model_name
+;
+
+-- =====================================================================
 -- 老客转化漏斗（按申请周，仅 user_tag = Existing）
 -- 完成率 = 完成 / 申请；通过率 = 通过 / 完成；成交率 = 成交 / 通过
 -- 成交口径：status ∈ Active_Account / Closed / Blocked
@@ -717,6 +946,224 @@ base AS (
     LEFT JOIN v
         ON cp.application_id = v.application_id
     WHERE cp.user_tag = 'New'
+),
+
+-- 标签 × 模型 展开成长表
+long AS (
+    SELECT
+        time_key,
+        application_id,
+        label_name,
+        model_name,
+        model_score,
+        label_value
+    FROM base
+    LATERAL VIEW STACK (
+        5,
+
+        'fpd7_flag','aus_new_risk_bid_3rdmodel_v1_0_20251201',score_value,fpd7_flag,
+        'duedate_1m_5','aus_new_risk_bid_3rdmodel_v1_0_20251201',score_value,duedate_1m_5,
+        'duedate_1m_30','aus_new_risk_bid_3rdmodel_v1_0_20251201',score_value,duedate_1m_30,
+        'duedate_2m_30','aus_new_risk_bid_3rdmodel_v1_0_20251201',score_value,duedate_2m_30,
+        'duedate_3m_30','aus_new_risk_bid_3rdmodel_v1_0_20251201',score_value,duedate_3m_30
+    ) AS label_name, model_name, model_score, label_value
+),
+
+-- ROC 累计量（仅已表现样本）
+roc_base AS (
+    SELECT
+        time_key,
+        label_name,
+        model_name,
+        application_id,
+        model_score,
+        label_value,
+
+        SUM(label_value) OVER (
+            PARTITION BY time_key, label_name, model_name
+        ) AS tot_y1,
+
+        SUM(1 - label_value) OVER (
+            PARTITION BY time_key, label_name, model_name
+        ) AS tot_y0,
+
+        SUM(label_value) OVER (
+            PARTITION BY time_key, label_name, model_name
+            ORDER BY model_score DESC
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS csum_y1,
+
+        SUM(1 - label_value) OVER (
+            PARTITION BY time_key, label_name, model_name
+            ORDER BY model_score DESC
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS csum_y0
+    FROM long
+    WHERE
+        label_value IN (0,1)
+        AND model_score IS NOT NULL
+),
+
+-- TPR / FPR + 前一节点
+roc_curve AS (
+    SELECT
+        time_key,
+        label_name,
+        model_name,
+
+        csum_y1 / tot_y1 AS tpr,
+        csum_y0 / tot_y0 AS fpr,
+
+        LEAD(csum_y1 / tot_y1) OVER (
+            PARTITION BY time_key, label_name, model_name
+            ORDER BY csum_y1 / tot_y1 DESC
+        ) AS pre_tpr,
+
+        LEAD(csum_y0 / tot_y0) OVER (
+            PARTITION BY time_key, label_name, model_name
+            ORDER BY csum_y0 / tot_y0 DESC
+        ) AS pre_fpr,
+
+        tot_y1,
+        tot_y0
+    FROM roc_base
+),
+
+-- ROC 梯形积分 AUC
+auc_agg AS (
+    SELECT
+        time_key,
+        label_name,
+        model_name,
+
+        MAX(tot_y1) AS pos_cnt,
+        MAX(tot_y0) AS neg_cnt,
+
+        SUM((tpr + pre_tpr) / 2 * (fpr - pre_fpr)) AS auc
+    FROM roc_curve
+    WHERE pre_tpr IS NOT NULL
+      AND pre_fpr IS NOT NULL
+    GROUP BY
+        time_key,
+        label_name,
+        model_name
+),
+
+-- 样本量统计
+cnt_agg AS (
+    SELECT
+        time_key,
+        label_name,
+        model_name,
+
+        COUNT(DISTINCT application_id) AS total_application_cnt,
+        SUM(CASE WHEN label_value IN (0,1) THEN 1 END) AS performance_cnt,
+        SUM(CASE WHEN label_value = 1 THEN 1 END) AS pos_cnt,
+        SUM(CASE WHEN label_value = 0 THEN 1 END) AS neg_cnt,
+        SUM(CASE WHEN label_value IS NULL THEN 1 END) AS unperformance_cnt
+    FROM long
+    GROUP BY
+        time_key,
+        label_name,
+        model_name
+)
+
+SELECT
+    c.time_key,
+    c.label_name,
+    c.model_name,
+
+    c.total_application_cnt,
+    c.performance_cnt,
+    c.pos_cnt,
+    c.neg_cnt,
+    c.unperformance_cnt,
+
+    a.pos_cnt   AS auc_pos_cnt,
+    a.neg_cnt   AS auc_neg_cnt,
+    a.auc
+FROM cnt_agg c
+LEFT JOIN auc_agg a
+    ON  c.time_key    = a.time_key
+    AND c.label_name  = a.label_name
+    AND c.model_name  = a.model_name
+;
+
+-- =====================================================================
+-- 新客月度 AUC（MBR 大盘口径）
+-- 与上方周度 AUC 同源同口径，仅时间粒度由周改为月：
+--   月口径 = 放款周（ISO 周）周四所在月，即覆盖该周多数日期的月份
+--   未放款申请（dispersal_week 为空）不参与月度统计
+-- =====================================================================
+
+DROP TABLE IF EXISTS model.tmp_eliam_risk_000006_monthly_auc;
+
+CREATE TABLE model.tmp_eliam_risk_000006_monthly_auc AS
+WITH v AS (
+    SELECT
+        application_id,
+        application_week,
+        dispersal_week,
+        aus_new_risk_bid_3rdmodel_v1_0_20251201,
+        fpd7_flag,
+        duedate_1m_5,
+        duedate_1m_30,
+        duedate_2m_30,
+        duedate_3m_30
+    FROM (
+        SELECT
+            application_id,
+            application_week,
+            dispersal_week,
+            aus_new_risk_bid_3rdmodel_v1_0_20251201,
+            fpd7_flag,
+            duedate_1m_5,
+            duedate_1m_30,
+            duedate_2m_30,
+            duedate_3m_30,
+            ROW_NUMBER() OVER (
+                PARTITION BY application_id
+                ORDER BY inserttime DESC, sample_datetime DESC
+            ) AS rn
+        FROM model.tmp_eliam_risk_000006_vintage_monitor
+        WHERE application_id IS NOT NULL
+    ) dedup
+    WHERE rn = 1
+),
+base AS (
+    SELECT
+        CASE
+            WHEN COALESCE(CAST(cp.dispersal_week AS STRING), CAST(v.dispersal_week AS STRING)) IS NULL THEN NULL
+            ELSE DATE_FORMAT(
+                DATE_ADD(
+                    DATE_SUB(
+                        TO_DATE(CONCAT(SUBSTR(COALESCE(CAST(cp.dispersal_week AS STRING), CAST(v.dispersal_week AS STRING)), 1, 4), '-01-04')),
+                        (DAYOFWEEK(TO_DATE(CONCAT(SUBSTR(COALESCE(CAST(cp.dispersal_week AS STRING), CAST(v.dispersal_week AS STRING)), 1, 4), '-01-04'))) + 5) % 7
+                    ),
+                    (CAST(SUBSTR(COALESCE(CAST(cp.dispersal_week AS STRING), CAST(v.dispersal_week AS STRING)), 6, 2) AS INT) - 1) * 7 + 3
+                ),
+                'yyyy-MM'
+            )
+        END AS time_key,
+        cp.application_id,
+
+        CASE
+            WHEN v.aus_new_risk_bid_3rdmodel_v1_0_20251201 IS NULL THEN NULL
+            WHEN REGEXP_REPLACE(CAST(v.aus_new_risk_bid_3rdmodel_v1_0_20251201 AS STRING), '[^-0-9eE+.]', '') = '' THEN NULL
+            WHEN CAST(REGEXP_REPLACE(CAST(v.aus_new_risk_bid_3rdmodel_v1_0_20251201 AS STRING), '[^-0-9eE+.]', '') AS DOUBLE) < 0 THEN NULL
+            ELSE CAST(REGEXP_REPLACE(CAST(v.aus_new_risk_bid_3rdmodel_v1_0_20251201 AS STRING), '[^-0-9eE+.]', '') AS DOUBLE)
+        END AS score_value,
+
+        CAST(v.fpd7_flag AS INT) AS fpd7_flag,
+        CAST(v.duedate_1m_5 AS INT) AS duedate_1m_5,
+        CAST(v.duedate_1m_30 AS INT) AS duedate_1m_30,
+        CAST(v.duedate_2m_30 AS INT) AS duedate_2m_30,
+        CAST(v.duedate_3m_30 AS INT) AS duedate_3m_30
+    FROM ba.customer_profile_rawdata cp
+    LEFT JOIN v
+        ON cp.application_id = v.application_id
+    WHERE cp.user_tag = 'New'
+      AND COALESCE(CAST(cp.dispersal_week AS STRING), CAST(v.dispersal_week AS STRING)) IS NOT NULL
 ),
 
 -- 标签 × 模型 展开成长表

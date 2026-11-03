@@ -36,6 +36,7 @@ if hasattr(sys.stderr, "reconfigure"):
 PROJECT_DIR = Path(__file__).resolve().parent
 SQL_FILE = PROJECT_DIR / "fundo_model_monitor.sql"
 CSV_FILE = PROJECT_DIR / "原始数据" / "model_monitor_auc.csv"
+MONTHLY_CSV_FILE = PROJECT_DIR / "原始数据" / "model_monitor_monthly_auc.csv"
 FUNNEL_CSV_FILE = PROJECT_DIR / "原始数据" / "model_monitor_funnel.csv"
 BIN_CSV_FILE = PROJECT_DIR / "原始数据" / "model_monitor_bin.csv"
 DIST_CSV_FILE = PROJECT_DIR / "原始数据" / "model_monitor_score_dist.csv"
@@ -113,7 +114,7 @@ SEGMENT_TOKENS = {"existing": "000004", "new": "000006"}
 
 def configure_segment(key):
     global SEGMENT_KEY, SEGMENT, LABELS, MODELS
-    global SQL_FILE, CSV_FILE, FUNNEL_CSV_FILE, BIN_CSV_FILE, DIST_CSV_FILE, BINF_CSV_FILE
+    global SQL_FILE, CSV_FILE, MONTHLY_CSV_FILE, FUNNEL_CSV_FILE, BIN_CSV_FILE, DIST_CSV_FILE, BINF_CSV_FILE
 
     segment = SEGMENTS[key]
     SEGMENT_KEY = key
@@ -124,6 +125,7 @@ def configure_segment(key):
 
     data_dir = segment["data_dir"]
     CSV_FILE = data_dir / "model_monitor_auc.csv"
+    MONTHLY_CSV_FILE = data_dir / "model_monitor_monthly_auc.csv"
     FUNNEL_CSV_FILE = data_dir / "model_monitor_funnel.csv"
     BIN_CSV_FILE = data_dir / "model_monitor_bin.csv"
     DIST_CSV_FILE = data_dir / "model_monitor_score_dist.csv"
@@ -328,6 +330,75 @@ def build_payload(df):
     }
 
 
+_MONTH_RE = re.compile(r"^(\d{4})-?M?(\d{2})$", re.I)
+
+
+def build_monthly_payload(df):
+    """月度 AUC，结构同周度，但 time_key 统一为 yyyy-MM。"""
+    if df is None or len(df) == 0:
+        return {"months": [], "labels": [], "models": [], "rows": {}}
+
+    required = {
+        "time_key", "label_name", "model_name", "auc",
+        "total_application_cnt", "performance_cnt", "pos_cnt", "neg_cnt",
+    }
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"月度 AUC 结果缺少字段：{', '.join(sorted(missing))}")
+
+    df = df.copy()
+    df["time_key"] = df["time_key"].astype(str)
+
+    def month_key(value):
+        match = _MONTH_RE.match(value.strip())
+        return f"{match.group(1)}-{match.group(2)}" if match else value.strip()
+
+    df["time_key"] = df["time_key"].map(month_key)
+    df = df[df["time_key"].str.lower() != "nan"]
+    months = sorted(df["time_key"].unique(), key=natural_key)
+
+    label_keys = [key for key, _ in LABELS]
+    model_keys = [key for key, _, _, _ in MODELS]
+    labels = [key for key in label_keys if key in set(df["label_name"])]
+    labels += sorted(set(df["label_name"]) - set(labels))
+    models = [key for key in model_keys if key in set(df["model_name"])]
+    models += sorted(set(df["model_name"]) - set(models))
+    model_meta = {key: (family, version) for key, family, version, _ in MODELS}
+
+    def number(value):
+        return None if pd.isna(value) else float(value)
+
+    def count(value):
+        return None if pd.isna(value) else int(value)
+
+    rows = {}
+    for (label, month, model), group in df.groupby(
+        ["label_name", "time_key", "model_name"], sort=False
+    ):
+        point = group.iloc[0]
+        rows.setdefault(label, {}).setdefault(month, {})[model] = {
+            "auc": number(point["auc"]),
+            "total": count(point["total_application_cnt"]),
+            "perf": count(point["performance_cnt"]),
+            "pos": count(point["pos_cnt"]),
+            "neg": count(point["neg_cnt"]),
+        }
+
+    return {
+        "months": months,
+        "labels": [{"key": key, "name": dict(LABELS).get(key, key)} for key in labels],
+        "models": [
+            {
+                "key": key,
+                "name": model_meta.get(key, (key, ""))[0],
+                "version": model_meta.get(key, (key, ""))[1],
+            }
+            for key in models
+        ],
+        "rows": rows,
+    }
+
+
 def build_funnel_payload(df):
     if df is None or len(df) == 0:
         return None
@@ -457,8 +528,9 @@ def build_binf_payload(df):
     }
 
 
-def build_dataset(df, funnel_df, bin_df, dist_df, binf_df, source_name):
+def build_dataset(df, funnel_df, bin_df, dist_df, binf_df, source_name, monthly_df=None):
     payload = build_payload(df)
+    payload["monthlyAuc"] = build_monthly_payload(monthly_df)
     payload["funnel"] = build_funnel_payload(funnel_df)
     payload["bins"] = build_bin_payload(bin_df)
     payload["dist"] = build_dist_payload(dist_df)
@@ -475,16 +547,70 @@ def build_dataset(df, funnel_df, bin_df, dist_df, binf_df, source_name):
     return payload
 
 
+def build_mbr_summary(datasets):
+    """把各客群的周度/月度 AUC 汇总成 MBR PPT 取数用的稳定 JSON 结构。"""
+    metrics = []
+    for key, payload in datasets.items():
+        segment = payload.get("segment", {})
+        seg_key = segment.get("key", key)
+        seg_name = segment.get("name", key)
+        label_names = {item["key"]: item["name"] for item in payload.get("labels", [])}
+        model_meta = {item["key"]: item for item in payload.get("models", [])}
+
+        def add(granularity, period, label, model, point):
+            meta = model_meta.get(model, {})
+            metrics.append({
+                "segment": seg_key,
+                "segmentName": seg_name,
+                "granularity": granularity,
+                "period": period,
+                "label": label,
+                "labelName": label_names.get(label, label),
+                "model": model,
+                "modelName": meta.get("name", model),
+                "modelVersion": meta.get("version", ""),
+                "auc": point.get("auc"),
+                "n": point.get("total"),
+                "perf": point.get("perf"),
+                "pos": point.get("pos"),
+                "neg": point.get("neg"),
+            })
+
+        weeks = payload.get("weeks", [])[-12:]
+        for label, week_rows in payload.get("rows", {}).items():
+            for week in weeks:
+                for model, point in week_rows.get(week, {}).items():
+                    add("week", week, label, model, point)
+
+        months = payload.get("monthlyAuc", {}).get("months", [])[-24:]
+        for label, month_rows in payload.get("monthlyAuc", {}).get("rows", {}).items():
+            for month in months:
+                for model, point in month_rows.get(month, {}).items():
+                    add("month", month, label, model, point)
+
+    return {
+        "source": "fundo",
+        "generatedAt": now().isoformat(timespec="seconds"),
+        "metrics": metrics,
+    }
+
+
 def build_html(datasets):
     data = json.dumps(datasets, ensure_ascii=False)
-    return HTML_TEMPLATE.replace("__DATA_JSON__", data)
+    mbr = json.dumps(build_mbr_summary(datasets), ensure_ascii=False).replace("</", "<\\/")
+    return (
+        HTML_TEMPLATE
+        .replace("__MBR_JSON__", mbr)
+        .replace("__DATA_JSON__", data)
+    )
 
 
-def save_dataset_csvs(df, funnel_df, bin_df, dist_df, binf_df):
+def save_dataset_csvs(df, funnel_df, bin_df, dist_df, binf_df, monthly_df=None):
     CSV_FILE.parent.mkdir(parents=True, exist_ok=True)
     written = []
     for path, frame, label in (
         (CSV_FILE, df, "结果"),
+        (MONTHLY_CSV_FILE, monthly_df, "月度结果"),
         (FUNNEL_CSV_FILE, funnel_df, "转化"),
         (BIN_CSV_FILE, bin_df, "分箱"),
         (DIST_CSV_FILE, dist_df, "分布"),
@@ -498,7 +624,8 @@ def save_dataset_csvs(df, funnel_df, bin_df, dist_df, binf_df):
     return written
 
 
-def load_dataset(auc_path, funnel_csv=None, bin_csv=None, dist_csv=None, binf_csv=None):
+def load_dataset(auc_path, funnel_csv=None, bin_csv=None, dist_csv=None, binf_csv=None,
+                 monthly_csv=None):
     auc_path = Path(auc_path)
     df = load_result(auc_path)
     base_dir = auc_path.parent
@@ -510,6 +637,8 @@ def load_dataset(auc_path, funnel_csv=None, bin_csv=None, dist_csv=None, binf_cs
             return None
         return load_result(path)
 
+    monthly_df = sibling(monthly_csv, MONTHLY_CSV_FILE.name, "月度 AUC 数据")
+
     return build_dataset(
         df,
         sibling(funnel_csv, FUNNEL_CSV_FILE.name, "转化数据"),
@@ -517,6 +646,7 @@ def load_dataset(auc_path, funnel_csv=None, bin_csv=None, dist_csv=None, binf_cs
         sibling(dist_csv, DIST_CSV_FILE.name, "分布数据"),
         sibling(binf_csv, BINF_CSV_FILE.name, "分箱转化数据"),
         None,
+        monthly_df,
     )
 
 
@@ -530,6 +660,7 @@ def main(argv=None):
     parser.add_argument("--bin-csv", help="配合 --from-csv 的分箱结果 CSV；默认取同目录 model_monitor_bin.csv")
     parser.add_argument("--dist-csv", help="配合 --from-csv 的分布结果 CSV；默认取同目录 model_monitor_score_dist.csv")
     parser.add_argument("--bin-funnel-csv", help="配合 --from-csv 的分箱转化结果 CSV；默认取同目录 model_monitor_bin_funnel.csv")
+    parser.add_argument("--monthly-csv", help="配合 --from-csv 的月度 AUC 结果 CSV；默认取同目录 model_monitor_monthly_auc.csv")
     args = parser.parse_args(argv)
 
     datasets = {}
@@ -541,7 +672,8 @@ def main(argv=None):
                 parser.error("--segment existing/both 需要 --from-csv")
             configure_segment("existing")
             datasets["existing"] = load_dataset(
-                args.from_csv, args.funnel_csv, args.bin_csv, args.dist_csv, args.bin_funnel_csv
+                args.from_csv, args.funnel_csv, args.bin_csv, args.dist_csv,
+                args.bin_funnel_csv, args.monthly_csv,
             )
         if args.segment in ("both", "new"):
             new_path = (Path(args.new_from_csv) if args.new_from_csv
@@ -574,16 +706,19 @@ def main(argv=None):
             configure_segment(key)
             print(f"\n===== {SEGMENT['title']} =====")
             segment_results = results_by_segment.get(key, [])
-            df, source_table = pick_result(segment_results, "auc", 0)
-            funnel_df, _ = pick_result(segment_results, "funnel", 1)
-            bin_df, _ = pick_result(segment_results, "bin", 2)
-            dist_df, _ = pick_result(segment_results, "dist", 3)
-            binf_df, _ = pick_result(segment_results, "bin_funnel", 4)
+            df, source_table = pick_result(segment_results, "weekly_auc", 0)
+            monthly_df, _ = pick_result(segment_results, "monthly_auc", 1)
+            funnel_df, _ = pick_result(segment_results, "funnel", 2)
+            bin_df, _ = pick_result(segment_results, "bin", 3)
+            dist_df, _ = pick_result(segment_results, "dist", 4)
+            binf_df, _ = pick_result(segment_results, "bin_funnel", 5)
 
             if df is None or len(df) == 0:
                 print("警告 | AUC 查询结果为空，看板将显示空状态")
-            zip_paths.extend(save_dataset_csvs(df, funnel_df, bin_df, dist_df, binf_df))
-            datasets[key] = build_dataset(df, funnel_df, bin_df, dist_df, binf_df, source_table)
+            zip_paths.extend(save_dataset_csvs(df, funnel_df, bin_df, dist_df, binf_df, monthly_df))
+            datasets[key] = build_dataset(
+                df, funnel_df, bin_df, dist_df, binf_df, source_table, monthly_df
+            )
 
         if zip_paths:
             write_zip(zip_paths)
@@ -817,6 +952,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </details>
   </section>
 
+  <section class="card" id="monthly-card" hidden>
+    <div class="card-head">
+      <h2>月度 AUC · MBR 口径</h2>
+      <span class="hint">按放款周所属月份聚合（覆盖该周多数日期的月份），口径与周度 AUC 一致</span>
+    </div>
+    <details class="table-view" open>
+      <summary>月度表格</summary>
+      <div class="table-scroll" id="monthly-table"></div>
+    </details>
+  </section>
+
   <section class="card">
     <div class="card-head">
       <h2>周度样本量</h2>
@@ -917,6 +1063,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 </div>
 
 <div id="tooltip" role="status"></div>
+
+<script id="mbr-summary" type="application/json">__MBR_JSON__</script>
 
 <script>
 const DATASETS = __DATA_JSON__;
@@ -1665,6 +1813,68 @@ function renderTable(weeks) {
       + Math.round(DATA.maturityThreshold * 100) + '%），AUC 波动较大，仅供参考';
     box.appendChild(note);
   }
+}
+
+function renderMonthlyTable() {
+  const card = $('#monthly-card');
+  const box = $('#monthly-table');
+  const monthly = DATA.monthlyAuc;
+  box.textContent = '';
+  if (!monthly || !monthly.months || !monthly.months.length) {
+    card.hidden = true;
+    return;
+  }
+  card.hidden = false;
+  const models = visibleModels();
+  const table = document.createElement('table');
+
+  const thead = document.createElement('thead');
+  const headRow = document.createElement('tr');
+  ['月'].forEach((t) => { const th = document.createElement('th'); th.textContent = t; headRow.appendChild(th); });
+  models.forEach((model) => { const th = document.createElement('th'); th.textContent = model.display; headRow.appendChild(th); });
+  ['已表现', '坏样本', '坏率'].forEach((t) => { const th = document.createElement('th'); th.textContent = t; headRow.appendChild(th); });
+  thead.appendChild(headRow);
+  table.appendChild(thead);
+
+  const rows = monthly.rows[state.label] || {};
+  const tbody = document.createElement('tbody');
+  monthly.months.slice().reverse().forEach((month) => {
+    const tr = document.createElement('tr');
+    const th = document.createElement('td');
+    th.textContent = month;
+    tr.appendChild(th);
+    const monthCells = rows[month] || {};
+    let perf = null;
+    let pos = null;
+    models.forEach((model) => {
+      const c = monthCells[model.key];
+      const td = document.createElement('td');
+      td.textContent = c ? fmtAuc(c.auc) : '—';
+      tr.appendChild(td);
+      if (c) {
+        if (perf === null && c.perf !== null && c.perf !== undefined) perf = c.perf;
+        if (pos === null && c.pos !== null && c.pos !== undefined) pos = c.pos;
+      }
+    });
+    const tdPerf = document.createElement('td');
+    tdPerf.textContent = perf === null ? '—' : fmtInt.format(perf);
+    tr.appendChild(tdPerf);
+    const tdPos = document.createElement('td');
+    tdPos.textContent = pos === null ? '—' : fmtInt.format(pos);
+    tr.appendChild(tdPos);
+    const tdRate = document.createElement('td');
+    tdRate.textContent = (perf && pos !== null) ? (pos / perf * 100).toFixed(1) + '%' : '—';
+    tr.appendChild(tdRate);
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  box.appendChild(table);
+
+  const note = document.createElement('p');
+  note.className = 'table-note';
+  note.textContent = '最近月份可能尚未完全成熟，请结合「已表现」「坏样本」量一起判断；'
+    + '月度 AUC 为当月全部已表现样本的 pooled 值，不是周度 AUC 的简单平均。';
+  box.appendChild(note);
 }
 
 const FUNNEL_SERIES = [
@@ -2575,6 +2785,7 @@ function renderAll() {
   renderAucChart(weeks);
   renderCountChart(weeks);
   renderTable(weeks);
+  renderMonthlyTable();
   renderFunnel();
   renderBinModelOptions();
   renderBins();
