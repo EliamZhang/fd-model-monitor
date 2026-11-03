@@ -10,7 +10,7 @@
     1. 读取合并后的 fundo_model_monitor.sql，按分号拆成语句执行（DROP / CREATE / 可选 SELECT）；
        老客 00004 与新客 00006 的语句在同一个文件里，按 --segment 只执行对应部分
     2. 没有 SELECT 语句时，自动 SELECT * FROM CREATE 出来的每张表
-    3. 按结果表名（000004 / 000006）拆分，分别写入各 segment 的数据目录，并打包成 zip
+    3. 按结果表名（000004 / 000006）拆分，分别写入各 segment 的数据目录，最后合并打包成一个 zip
     4. 生成一个统一的 HTML 看板，用顶部客群按钮切换老客/新客（数据内嵌，离线可开）
 """
 
@@ -75,7 +75,6 @@ SEGMENTS = {
         "name": "老客",
         "sql_file": PROJECT_DIR / "fundo_model_monitor.sql",
         "data_dir": PROJECT_DIR / "原始数据",
-        "zip_file": PROJECT_DIR / "model_monitor_data.zip",
         "labels": LABELS,
         "models": MODELS,
         "meta_hint": "周 = 放款周（dispersal_week，图中显示为该周周一日期），申请表驱动，分数取每申请最新一次 run",
@@ -92,7 +91,6 @@ SEGMENTS = {
         "name": "新客",
         "sql_file": PROJECT_DIR / "fundo_model_monitor.sql",
         "data_dir": PROJECT_DIR / "原始数据_新客",
-        "zip_file": PROJECT_DIR / "model_monitor_data_new.zip",
         "labels": LABELS,
         "models": [
             ("aus_new_risk_bid_3rdmodel_v1_0_20251201", "3rdmodel 新客主模型", "", []),
@@ -116,7 +114,6 @@ SEGMENT_TOKENS = {"existing": "000004", "new": "000006"}
 def configure_segment(key):
     global SEGMENT_KEY, SEGMENT, LABELS, MODELS
     global SQL_FILE, CSV_FILE, FUNNEL_CSV_FILE, BIN_CSV_FILE, DIST_CSV_FILE, BINF_CSV_FILE
-    global ZIP_FILE
 
     segment = SEGMENTS[key]
     SEGMENT_KEY = key
@@ -131,7 +128,6 @@ def configure_segment(key):
     BIN_CSV_FILE = data_dir / "model_monitor_bin.csv"
     DIST_CSV_FILE = data_dir / "model_monitor_score_dist.csv"
     BINF_CSV_FILE = data_dir / "model_monitor_bin_funnel.csv"
-    ZIP_FILE = segment["zip_file"]
 
 
 _UNFUNDED = "UNFUNDED"
@@ -232,12 +228,17 @@ def load_result(path):
 
 
 def write_zip(csv_paths):
-    """把结果 CSV 按 原始数据/ 目录结构打包，方便整包拉回本地。"""
+    """把所有结果 CSV 按各自的数据目录打包成一个 zip，方便整包拉回本地。"""
     temporary = ZIP_FILE.with_suffix(".zip.tmp")
     with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("原始数据/", "")
+        folders = set()
         for csv_path in csv_paths:
-            archive.write(csv_path, f"原始数据/{csv_path.name}")
+            arcname = csv_path.relative_to(PROJECT_DIR).as_posix()
+            folder = str(Path(arcname).parent)
+            if folder not in folders:
+                archive.writestr(f"{folder}/", "")
+                folders.add(folder)
+            archive.write(csv_path, arcname)
     temporary.replace(ZIP_FILE)
 
 
@@ -494,9 +495,7 @@ def save_dataset_csvs(df, funnel_df, bin_df, dist_df, binf_df):
         frame.to_csv(path, index=False, encoding="utf-8-sig")
         written.append(path)
         print(f"已保存{label} | {path}（{len(frame)} 行）")
-    if written:
-        write_zip(written)
-        print(f"已打包 | {ZIP_FILE}")
+    return written
 
 
 def load_dataset(auc_path, funnel_csv=None, bin_csv=None, dist_csv=None, binf_csv=None):
@@ -569,6 +568,7 @@ def main(argv=None):
             None if len(keys) == 2 else SEGMENT_TOKENS[keys[0]],
         )
         results_by_segment = split_results_by_segment(results)
+        zip_paths = []
 
         for key in keys:
             configure_segment(key)
@@ -582,8 +582,12 @@ def main(argv=None):
 
             if df is None or len(df) == 0:
                 print("警告 | AUC 查询结果为空，看板将显示空状态")
-            save_dataset_csvs(df, funnel_df, bin_df, dist_df, binf_df)
+            zip_paths.extend(save_dataset_csvs(df, funnel_df, bin_df, dist_df, binf_df))
             datasets[key] = build_dataset(df, funnel_df, bin_df, dist_df, binf_df, source_table)
+
+        if zip_paths:
+            write_zip(zip_paths)
+            print(f"\n已打包 | {ZIP_FILE}")
 
     if not datasets:
         print("没有可用的数据，未生成看板")
