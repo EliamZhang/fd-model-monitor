@@ -98,8 +98,9 @@ SEGMENTS = {
             ("aus_new_risk_bid_3rdmodel_v1_0_20251201", "3rdmodel 新客主模型", "", []),
         ],
         "meta_hint": "周 = 放款周（dispersal_week，图中显示为该周周一日期），申请表驱动，分数取每申请最新一行",
-        "bin_hint": "等频箱 1-5（源表 _bin 五档）",
-        "note": "模型说明：新客 3rdmodel v1.0（aus_new_risk_bid_3rdmodel_v1_0_20251201）；分箱为源表 _bin 的等频五档。"
+        "bin_hint": "模型分箱 1-5（阈值 0.062086/0.091284/0.128392/0.188973）",
+        "note": "模型说明：新客 3rdmodel v1.0（aus_new_risk_bid_3rdmodel_v1_0_20251201）；"
+                "分箱按模型分固定阈值 0.062086 / 0.091284 / 0.128392 / 0.188973 划分。"
                 "口径说明：以 ba.customer_profile_rawdata 中 user_tag = 'New' 的申请为驱动表，"
                 "分数与标签取自 model.tmp_eliam_risk_000006_vintage_monitor；转化漏斗以申请全量为分母，"
                 "无效分（-1）不参与 AUC / 分箱统计，未放款申请不参与 AUC。",

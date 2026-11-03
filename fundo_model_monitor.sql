@@ -651,7 +651,8 @@ GROUP BY time_key, model_name, model_bin
 -- 标签：FPD7 + 首期 5+/30+、2 期 30+、3 期 30+
 -- 分数：aus_new_risk_bid_3rdmodel_v1_0_20251201
 --   * 源字段可能是字符串，且 -1 / '-1.0 表示无效分，统一清洗为 NULL
--- 分箱：直接使用源表 _bin 字段（等频五档 20/40/60/80/100 -> 1-5）
+-- 分箱：按模型分固定阈值划分
+--   <=0.062086 -> 1；<=0.091284 -> 2；<=0.128392 -> 3；<=0.188973 -> 4；>0.188973 -> 5
 -- 去重：源表并非严格 1 行/申请（2026 年放款申请约 1.3 行/申请），
 --       统一按 application_id 取 inserttime 最新一行（与老客 000004 口径一致）
 -- =====================================================================
@@ -670,7 +671,6 @@ WITH v AS (
         application_week,
         dispersal_week,
         aus_new_risk_bid_3rdmodel_v1_0_20251201,
-        aus_new_risk_bid_3rdmodel_v1_0_20251201_bin,
         fpd7_flag,
         duedate_1m_5,
         duedate_1m_30,
@@ -682,7 +682,6 @@ WITH v AS (
             application_week,
             dispersal_week,
             aus_new_risk_bid_3rdmodel_v1_0_20251201,
-            aus_new_risk_bid_3rdmodel_v1_0_20251201_bin,
             fpd7_flag,
             duedate_1m_5,
             duedate_1m_30,
@@ -926,7 +925,7 @@ GROUP BY time_key
 
 -- =====================================================================
 -- 3) 分箱坏账率（按放款周）
--- 箱 1-5 直接映射源表 _bin 的等频五档（20/40/60/80/100）
+-- 箱 1-5 按模型分固定阈值划分（0.062086 / 0.091284 / 0.128392 / 0.188973）
 -- 标签：FPD7、首期 30+
 -- =====================================================================
 
@@ -939,7 +938,6 @@ WITH v AS (
         application_week,
         dispersal_week,
         aus_new_risk_bid_3rdmodel_v1_0_20251201,
-        aus_new_risk_bid_3rdmodel_v1_0_20251201_bin,
         fpd7_flag,
         duedate_1m_5,
         duedate_1m_30,
@@ -951,7 +949,6 @@ WITH v AS (
             application_week,
             dispersal_week,
             aus_new_risk_bid_3rdmodel_v1_0_20251201,
-            aus_new_risk_bid_3rdmodel_v1_0_20251201_bin,
             fpd7_flag,
             duedate_1m_5,
             duedate_1m_30,
@@ -974,13 +971,8 @@ base AS (
             WHEN v.aus_new_risk_bid_3rdmodel_v1_0_20251201 IS NULL THEN NULL
             WHEN REGEXP_REPLACE(CAST(v.aus_new_risk_bid_3rdmodel_v1_0_20251201 AS STRING), '[^-0-9eE+.]', '') = '' THEN NULL
             WHEN CAST(REGEXP_REPLACE(CAST(v.aus_new_risk_bid_3rdmodel_v1_0_20251201 AS STRING), '[^-0-9eE+.]', '') AS DOUBLE) < 0 THEN NULL
-            WHEN CAST(v.aus_new_risk_bid_3rdmodel_v1_0_20251201_bin AS INT) = 20  THEN 1
-            WHEN CAST(v.aus_new_risk_bid_3rdmodel_v1_0_20251201_bin AS INT) = 40  THEN 2
-            WHEN CAST(v.aus_new_risk_bid_3rdmodel_v1_0_20251201_bin AS INT) = 60  THEN 3
-            WHEN CAST(v.aus_new_risk_bid_3rdmodel_v1_0_20251201_bin AS INT) = 80  THEN 4
-            WHEN CAST(v.aus_new_risk_bid_3rdmodel_v1_0_20251201_bin AS INT) = 100 THEN 5
-            ELSE NULL
-        END AS score_bin,
+            ELSE CAST(REGEXP_REPLACE(CAST(v.aus_new_risk_bid_3rdmodel_v1_0_20251201 AS STRING), '[^-0-9eE+.]', '') AS DOUBLE)
+        END AS score_value,
 
         CAST(v.fpd7_flag AS INT) AS fpd7_flag,
         CAST(v.duedate_1m_30 AS INT) AS duedate_1m_30
@@ -990,6 +982,22 @@ base AS (
     WHERE cp.user_tag = 'New'
 ),
 
+scored AS (
+    SELECT
+        time_key,
+        CASE
+            WHEN score_value IS NULL THEN NULL
+            WHEN score_value <= 0.062086 THEN 1
+            WHEN score_value <= 0.091284 THEN 2
+            WHEN score_value <= 0.128392 THEN 3
+            WHEN score_value <= 0.188973 THEN 4
+            ELSE 5
+        END AS score_bin,
+        fpd7_flag,
+        duedate_1m_30
+    FROM base
+),
+
 long AS (
     SELECT
         time_key,
@@ -997,7 +1005,7 @@ long AS (
         model_name,
         model_bin,
         label_value
-    FROM base
+    FROM scored
     LATERAL VIEW STACK (
         2,
 
@@ -1034,7 +1042,6 @@ WITH v AS (
         application_week,
         dispersal_week,
         aus_new_risk_bid_3rdmodel_v1_0_20251201,
-        aus_new_risk_bid_3rdmodel_v1_0_20251201_bin,
         fpd7_flag,
         duedate_1m_5,
         duedate_1m_30,
@@ -1046,7 +1053,6 @@ WITH v AS (
             application_week,
             dispersal_week,
             aus_new_risk_bid_3rdmodel_v1_0_20251201,
-            aus_new_risk_bid_3rdmodel_v1_0_20251201_bin,
             fpd7_flag,
             duedate_1m_5,
             duedate_1m_30,
@@ -1070,24 +1076,34 @@ base AS (
             WHEN v.aus_new_risk_bid_3rdmodel_v1_0_20251201 IS NULL THEN NULL
             WHEN REGEXP_REPLACE(CAST(v.aus_new_risk_bid_3rdmodel_v1_0_20251201 AS STRING), '[^-0-9eE+.]', '') = '' THEN NULL
             WHEN CAST(REGEXP_REPLACE(CAST(v.aus_new_risk_bid_3rdmodel_v1_0_20251201 AS STRING), '[^-0-9eE+.]', '') AS DOUBLE) < 0 THEN NULL
-            WHEN CAST(v.aus_new_risk_bid_3rdmodel_v1_0_20251201_bin AS INT) = 20  THEN 1
-            WHEN CAST(v.aus_new_risk_bid_3rdmodel_v1_0_20251201_bin AS INT) = 40  THEN 2
-            WHEN CAST(v.aus_new_risk_bid_3rdmodel_v1_0_20251201_bin AS INT) = 60  THEN 3
-            WHEN CAST(v.aus_new_risk_bid_3rdmodel_v1_0_20251201_bin AS INT) = 80  THEN 4
-            WHEN CAST(v.aus_new_risk_bid_3rdmodel_v1_0_20251201_bin AS INT) = 100 THEN 5
-            ELSE NULL
-        END AS model_bin
+            ELSE CAST(REGEXP_REPLACE(CAST(v.aus_new_risk_bid_3rdmodel_v1_0_20251201 AS STRING), '[^-0-9eE+.]', '') AS DOUBLE)
+        END AS score_value
     FROM ba.customer_profile_rawdata cp
     LEFT JOIN v
         ON cp.application_id = v.application_id
     WHERE cp.user_tag = 'New'
+),
+
+binned AS (
+    SELECT
+        time_key,
+        model_name,
+        CASE
+            WHEN score_value IS NULL THEN NULL
+            WHEN score_value <= 0.062086 THEN 1
+            WHEN score_value <= 0.091284 THEN 2
+            WHEN score_value <= 0.128392 THEN 3
+            WHEN score_value <= 0.188973 THEN 4
+            ELSE 5
+        END AS model_bin
+    FROM base
 )
 SELECT
     time_key,
     model_name,
     model_bin,
     COUNT(*) AS application_cnt
-FROM base
+FROM binned
 WHERE model_bin IS NOT NULL
   AND time_key IS NOT NULL
 GROUP BY time_key, model_name, model_bin
@@ -1108,7 +1124,6 @@ WITH v AS (
         application_week,
         dispersal_week,
         aus_new_risk_bid_3rdmodel_v1_0_20251201,
-        aus_new_risk_bid_3rdmodel_v1_0_20251201_bin,
         fpd7_flag,
         duedate_1m_5,
         duedate_1m_30,
@@ -1120,7 +1135,6 @@ WITH v AS (
             application_week,
             dispersal_week,
             aus_new_risk_bid_3rdmodel_v1_0_20251201,
-            aus_new_risk_bid_3rdmodel_v1_0_20251201_bin,
             fpd7_flag,
             duedate_1m_5,
             duedate_1m_30,
@@ -1144,13 +1158,8 @@ base AS (
             WHEN v.aus_new_risk_bid_3rdmodel_v1_0_20251201 IS NULL THEN NULL
             WHEN REGEXP_REPLACE(CAST(v.aus_new_risk_bid_3rdmodel_v1_0_20251201 AS STRING), '[^-0-9eE+.]', '') = '' THEN NULL
             WHEN CAST(REGEXP_REPLACE(CAST(v.aus_new_risk_bid_3rdmodel_v1_0_20251201 AS STRING), '[^-0-9eE+.]', '') AS DOUBLE) < 0 THEN NULL
-            WHEN CAST(v.aus_new_risk_bid_3rdmodel_v1_0_20251201_bin AS INT) = 20  THEN 1
-            WHEN CAST(v.aus_new_risk_bid_3rdmodel_v1_0_20251201_bin AS INT) = 40  THEN 2
-            WHEN CAST(v.aus_new_risk_bid_3rdmodel_v1_0_20251201_bin AS INT) = 60  THEN 3
-            WHEN CAST(v.aus_new_risk_bid_3rdmodel_v1_0_20251201_bin AS INT) = 80  THEN 4
-            WHEN CAST(v.aus_new_risk_bid_3rdmodel_v1_0_20251201_bin AS INT) = 100 THEN 5
-            ELSE NULL
-        END AS model_bin,
+            ELSE CAST(REGEXP_REPLACE(CAST(v.aus_new_risk_bid_3rdmodel_v1_0_20251201 AS STRING), '[^-0-9eE+.]', '') AS DOUBLE)
+        END AS score_value,
 
         CASE
             WHEN cp.application_status IS NULL
@@ -1181,6 +1190,26 @@ base AS (
     LEFT JOIN v
         ON cp.application_id = v.application_id
     WHERE cp.user_tag = 'New'
+),
+
+binned AS (
+    SELECT
+        time_key,
+        model_name,
+        CASE
+            WHEN score_value IS NULL THEN NULL
+            WHEN score_value <= 0.062086 THEN 1
+            WHEN score_value <= 0.091284 THEN 2
+            WHEN score_value <= 0.128392 THEN 3
+            WHEN score_value <= 0.188973 THEN 4
+            ELSE 5
+        END AS model_bin,
+        completed_flag,
+        approved_flag,
+        auto_approved_flag,
+        manual_approved_flag,
+        deal_flag
+    FROM base
 )
 SELECT
     time_key,
@@ -1192,7 +1221,7 @@ SELECT
     SUM(auto_approved_flag) AS auto_approved_cnt,
     SUM(manual_approved_flag) AS manual_approved_cnt,
     SUM(deal_flag) AS deal_cnt
-FROM base
+FROM binned
 WHERE model_bin IS NOT NULL
   AND time_key IS NOT NULL
 GROUP BY time_key, model_name, model_bin
