@@ -1,7 +1,8 @@
 -- =====================================================================
 -- 老客模型 by 周 AUC 监控（1.1 vs 1.2）
--- 数据源：model.tmp_eliam_risk_000004_strategy_run_log_v20261102
---   * 每个 application 取最新一次 run（app_order_desc = 1）
+-- 驱动表：ba.customer_profile_rawdata（1 行/申请，user_tag = 'Existing'）
+-- 分数源：model.tmp_eliam_risk_000004_strategy_run_log_v20261102
+--   * 每个 application 取最新一次 run（app_order_desc = 1），LEFT JOIN 补分数
 --   * 周口径：放款周 cp.dispersal_week，未放款归入 UNFUNDED
 -- 标签：FPD7 + 首期 5+/30+、2 期 30+、3 期 30+
 -- 监控分（5 标签 × 6 分 = STACK 30 行）：
@@ -14,7 +15,7 @@ DROP TABLE IF EXISTS model.tmp_eliam_risk_000004_strategy_weekly_auc;
 CREATE TABLE model.tmp_eliam_risk_000004_strategy_weekly_auc AS
 WITH base AS (
     SELECT
-        r.application_id,
+        cp.application_id,
         COALESCE(CAST(cp.dispersal_week AS STRING), 'UNFUNDED') AS time_key,
 
         CAST(r.old_risk_bid_submodel_250909_txn AS DOUBLE) AS old_risk_bid_submodel_250909_txn,
@@ -39,12 +40,13 @@ WITH base AS (
         CAST(lv.duedate_1m_30 AS INT) AS duedate_1m_30,
         CAST(lv.duedate_2m_30 AS INT) AS duedate_2m_30,
         CAST(lv.duedate_3m_30 AS INT) AS duedate_3m_30
-    FROM model.tmp_eliam_risk_000004_strategy_run_log_v20261102 r
-    LEFT JOIN ba.customer_profile_rawdata cp
-        ON r.application_id = cp.application_id
+    FROM ba.customer_profile_rawdata cp
+    LEFT JOIN model.tmp_eliam_risk_000004_strategy_run_log_v20261102 r
+        ON cp.application_id = r.application_id
+       AND r.app_order_desc = 1
     LEFT JOIN model.tmp_eliam_listing_vintage lv
-        ON r.application_id = lv.application_id
-    WHERE r.app_order_desc = 1
+        ON cp.application_id = lv.application_id
+    WHERE cp.user_tag = 'Existing'
 ),
 
 -- 标签 × 模型 展开成长表
@@ -261,11 +263,8 @@ WITH apps AS (
             WHEN cp.application_status = '4.Funded' THEN 1 ELSE 0
         END AS funded_flag
 
-    FROM model.tmp_eliam_risk_000004_strategy_run_log_v20261102 r
-    LEFT JOIN ba.customer_profile_rawdata cp
-        ON r.application_id = cp.application_id
-    WHERE r.app_order_desc = 1
-      AND cp.user_tag = 'Existing'
+    FROM ba.customer_profile_rawdata cp
+    WHERE cp.user_tag = 'Existing'
 )
 SELECT
     time_key,
@@ -362,12 +361,13 @@ WITH base AS (
         END AS INT) AS fpd7_flag,
 
         CAST(lv.duedate_1m_30 AS INT) AS duedate_1m_30
-    FROM model.tmp_eliam_risk_000004_strategy_run_log_v20261102 r
-    LEFT JOIN ba.customer_profile_rawdata cp
-        ON r.application_id = cp.application_id
+    FROM ba.customer_profile_rawdata cp
+    LEFT JOIN model.tmp_eliam_risk_000004_strategy_run_log_v20261102 r
+        ON cp.application_id = r.application_id
+       AND r.app_order_desc = 1
     LEFT JOIN model.tmp_eliam_listing_vintage lv
-        ON r.application_id = lv.application_id
-    WHERE r.app_order_desc = 1
+        ON cp.application_id = lv.application_id
+    WHERE cp.user_tag = 'Existing'
 ),
 
 long AS (
@@ -476,10 +476,11 @@ WITH base AS (
             ELSE 5
         END AS bin_app_v12
 
-    FROM model.tmp_eliam_risk_000004_strategy_run_log_v20261102 r
-    LEFT JOIN ba.customer_profile_rawdata cp
-        ON r.application_id = cp.application_id
-    WHERE r.app_order_desc = 1
+    FROM ba.customer_profile_rawdata cp
+    LEFT JOIN model.tmp_eliam_risk_000004_strategy_run_log_v20261102 r
+        ON cp.application_id = r.application_id
+       AND r.app_order_desc = 1
+    WHERE cp.user_tag = 'Existing'
 ),
 
 long AS (
@@ -598,10 +599,11 @@ WITH base AS (
             WHEN cp.status IN ('Active_Account', 'Closed', 'Blocked') THEN 1 ELSE 0
         END AS deal_flag
 
-    FROM model.tmp_eliam_risk_000004_strategy_run_log_v20261102 r
-    LEFT JOIN ba.customer_profile_rawdata cp
-        ON r.application_id = cp.application_id
-    WHERE r.app_order_desc = 1
+    FROM ba.customer_profile_rawdata cp
+    LEFT JOIN model.tmp_eliam_risk_000004_strategy_run_log_v20261102 r
+        ON cp.application_id = r.application_id
+       AND r.app_order_desc = 1
+    WHERE cp.user_tag = 'Existing'
 ),
 
 long AS (
@@ -638,11 +640,12 @@ GROUP BY time_key, model_name, model_bin
 
 -- =====================================================================
 -- 新客 3rdmodel 周度监控（RISK_000006）
--- 数据源：model.tmp_eliam_risk_000006_vintage_monitor（源表存在一行多记录，见下方去重口径）
--- 新老客口径：ba.customer_profile_rawdata.user_tag = 'New'
+-- 驱动表：ba.customer_profile_rawdata（1 行/申请，user_tag = 'New'）
+-- 分数/表现源：model.tmp_eliam_risk_000006_vintage_monitor（源表存在一行多记录，见下方去重口径）
+--   * 分数与标签通过 application_id LEFT JOIN 补入
 --   * 如线上枚举不是 'New'，只需统一修改下面 5 处 user_tag 条件
 --   * 上线前可先确认：SELECT user_tag, COUNT(*) FROM ba.customer_profile_rawdata GROUP BY user_tag;
--- 周口径：
+-- 周口径（周字段优先取驱动表 cp，缺失时回退到分数源）：
 --   AUC / 分箱坏账率 = 放款周 dispersal_week，未放款归入 UNFUNDED
 --   漏斗 / 分数分布 / 分箱转化 = 申请周 application_week
 -- 标签：FPD7 + 首期 5+/30+、2 期 30+、3 期 30+
@@ -696,8 +699,8 @@ WITH v AS (
 ),
 base AS (
     SELECT
-        v.application_id,
-        COALESCE(CAST(v.dispersal_week AS STRING), 'UNFUNDED') AS time_key,
+        cp.application_id,
+        COALESCE(CAST(cp.dispersal_week AS STRING), CAST(v.dispersal_week AS STRING), 'UNFUNDED') AS time_key,
 
         CASE
             WHEN v.aus_new_risk_bid_3rdmodel_v1_0_20251201 IS NULL THEN NULL
@@ -711,9 +714,9 @@ base AS (
         CAST(v.duedate_1m_30 AS INT) AS duedate_1m_30,
         CAST(v.duedate_2m_30 AS INT) AS duedate_2m_30,
         CAST(v.duedate_3m_30 AS INT) AS duedate_3m_30
-    FROM v
-    LEFT JOIN ba.customer_profile_rawdata cp
-        ON v.application_id = cp.application_id
+    FROM ba.customer_profile_rawdata cp
+    LEFT JOIN v
+        ON cp.application_id = v.application_id
     WHERE cp.user_tag = 'New'
 ),
 
@@ -869,40 +872,7 @@ LEFT JOIN auc_agg a
 DROP TABLE IF EXISTS model.tmp_eliam_risk_000006_weekly_funnel;
 
 CREATE TABLE model.tmp_eliam_risk_000006_weekly_funnel AS
-WITH v AS (
-    SELECT
-        application_id,
-        application_week,
-        dispersal_week,
-        aus_new_risk_bid_3rdmodel_v1_0_20251201,
-        aus_new_risk_bid_3rdmodel_v1_0_20251201_bin,
-        fpd7_flag,
-        duedate_1m_5,
-        duedate_1m_30,
-        duedate_2m_30,
-        duedate_3m_30
-    FROM (
-        SELECT
-            application_id,
-            application_week,
-            dispersal_week,
-            aus_new_risk_bid_3rdmodel_v1_0_20251201,
-            aus_new_risk_bid_3rdmodel_v1_0_20251201_bin,
-            fpd7_flag,
-            duedate_1m_5,
-            duedate_1m_30,
-            duedate_2m_30,
-            duedate_3m_30,
-            ROW_NUMBER() OVER (
-                PARTITION BY application_id
-                ORDER BY inserttime DESC, sample_datetime DESC
-            ) AS rn
-        FROM model.tmp_eliam_risk_000006_vintage_monitor
-        WHERE application_id IS NOT NULL
-    ) dedup
-    WHERE rn = 1
-),
-apps AS (
+WITH apps AS (
     SELECT
         CAST(cp.application_week AS STRING) AS time_key,
 
@@ -936,9 +906,7 @@ apps AS (
             WHEN cp.application_status = '4.Funded' THEN 1 ELSE 0
         END AS funded_flag
 
-    FROM v
-    LEFT JOIN ba.customer_profile_rawdata cp
-        ON v.application_id = cp.application_id
+    FROM ba.customer_profile_rawdata cp
     WHERE cp.user_tag = 'New'
 )
 SELECT
@@ -1000,7 +968,7 @@ WITH v AS (
 ),
 base AS (
     SELECT
-        COALESCE(CAST(v.dispersal_week AS STRING), 'UNFUNDED') AS time_key,
+        COALESCE(CAST(cp.dispersal_week AS STRING), CAST(v.dispersal_week AS STRING), 'UNFUNDED') AS time_key,
 
         CASE
             WHEN v.aus_new_risk_bid_3rdmodel_v1_0_20251201 IS NULL THEN NULL
@@ -1016,9 +984,9 @@ base AS (
 
         CAST(v.fpd7_flag AS INT) AS fpd7_flag,
         CAST(v.duedate_1m_30 AS INT) AS duedate_1m_30
-    FROM v
-    LEFT JOIN ba.customer_profile_rawdata cp
-        ON v.application_id = cp.application_id
+    FROM ba.customer_profile_rawdata cp
+    LEFT JOIN v
+        ON cp.application_id = v.application_id
     WHERE cp.user_tag = 'New'
 ),
 
@@ -1095,7 +1063,7 @@ WITH v AS (
 ),
 base AS (
     SELECT
-        CAST(v.application_week AS STRING) AS time_key,
+        COALESCE(CAST(cp.application_week AS STRING), CAST(v.application_week AS STRING)) AS time_key,
         'aus_new_risk_bid_3rdmodel_v1_0_20251201' AS model_name,
 
         CASE
@@ -1109,9 +1077,9 @@ base AS (
             WHEN CAST(v.aus_new_risk_bid_3rdmodel_v1_0_20251201_bin AS INT) = 100 THEN 5
             ELSE NULL
         END AS model_bin
-    FROM v
-    LEFT JOIN ba.customer_profile_rawdata cp
-        ON v.application_id = cp.application_id
+    FROM ba.customer_profile_rawdata cp
+    LEFT JOIN v
+        ON cp.application_id = v.application_id
     WHERE cp.user_tag = 'New'
 )
 SELECT
@@ -1169,7 +1137,7 @@ WITH v AS (
 ),
 base AS (
     SELECT
-        CAST(cp.application_week AS STRING) AS time_key,
+        COALESCE(CAST(cp.application_week AS STRING), CAST(v.application_week AS STRING)) AS time_key,
         'aus_new_risk_bid_3rdmodel_v1_0_20251201' AS model_name,
 
         CASE
@@ -1209,9 +1177,9 @@ base AS (
         CASE
             WHEN cp.status IN ('Active_Account', 'Closed', 'Blocked') THEN 1 ELSE 0
         END AS deal_flag
-    FROM v
-    LEFT JOIN ba.customer_profile_rawdata cp
-        ON v.application_id = cp.application_id
+    FROM ba.customer_profile_rawdata cp
+    LEFT JOIN v
+        ON cp.application_id = v.application_id
     WHERE cp.user_tag = 'New'
 )
 SELECT

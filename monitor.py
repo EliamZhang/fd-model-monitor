@@ -78,11 +78,13 @@ SEGMENTS = {
         "zip_file": PROJECT_DIR / "model_monitor_data.zip",
         "labels": LABELS,
         "models": MODELS,
-        "meta_hint": "周 = 放款周（dispersal_week，图中显示为该周周一日期），每申请取最新一次 run",
+        "meta_hint": "周 = 放款周（dispersal_week，图中显示为该周周一日期），申请表驱动，分数取每申请最新一次 run",
         "bin_hint": "行为箱 1-5",
         "note": "模型说明：mltmodel = 融合主模型，submodel = 银行流水子模型，appmodel = 行为子模型。"
-                "口径说明：标签取自 ba.customer_profile_rawdata（FPD7）与 model.tmp_eliam_listing_vintage（首期/2 期/3 期），"
-                "未放款申请不参与 AUC；最近一周的 FPD7、近 1-3 个月的 30+ 标签尚未成熟，样本量会明显偏低属正常现象。"
+                "口径说明：以 ba.customer_profile_rawdata 中 user_tag = 'Existing' 的申请为驱动表，"
+                "标签取自该表（FPD7）与 model.tmp_eliam_listing_vintage（首期/2 期/3 期），"
+                "分数取自 RISK_000004 策略日志；转化漏斗以申请全量为分母，未放款申请不参与 AUC；"
+                "最近一周的 FPD7、近 1-3 个月的 30+ 标签尚未成熟，样本量会明显偏低属正常现象。"
                 "v1.2 于 2026-09-23 上线，此前周的 v1.2 分为离线回填（回测口径）；submodel v1.2 在 2026Q1 前覆盖约 68%-81%。",
     },
     "new": {
@@ -95,11 +97,11 @@ SEGMENTS = {
         "models": [
             ("aus_new_risk_bid_3rdmodel_v1_0_20251201", "3rdmodel 新客主模型", "", []),
         ],
-        "meta_hint": "周 = 放款周（dispersal_week，图中显示为该周周一日期），每申请取最新一行",
+        "meta_hint": "周 = 放款周（dispersal_week，图中显示为该周周一日期），申请表驱动，分数取每申请最新一行",
         "bin_hint": "等频箱 1-5（源表 _bin 五档）",
         "note": "模型说明：新客 3rdmodel v1.0（aus_new_risk_bid_3rdmodel_v1_0_20251201）；分箱为源表 _bin 的等频五档。"
-                "口径说明：新老客按 ba.customer_profile_rawdata.user_tag = 'New' 区分；"
-                "标签取自 model.tmp_eliam_risk_000006_vintage_monitor；"
+                "口径说明：以 ba.customer_profile_rawdata 中 user_tag = 'New' 的申请为驱动表，"
+                "分数与标签取自 model.tmp_eliam_risk_000006_vintage_monitor；转化漏斗以申请全量为分母，"
                 "无效分（-1）不参与 AUC / 分箱统计，未放款申请不参与 AUC。",
     },
 }
