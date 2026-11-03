@@ -7,9 +7,10 @@
     python monitor.py --from-csv 原始数据/model_monitor_auc.csv   # 不连库，用已导出的结果重建看板
 
 流程：
-    1. 依次读取各 segment 的 SQL 文件，按分号拆成语句执行（DROP / CREATE / 可选 SELECT）
+    1. 读取合并后的 fundo_model_monitor.sql，按分号拆成语句执行（DROP / CREATE / 可选 SELECT）；
+       老客 00004 与新客 00006 的语句在同一个文件里，按 --segment 只执行对应部分
     2. 没有 SELECT 语句时，自动 SELECT * FROM CREATE 出来的每张表
-    3. 结果分别写入各 segment 的数据目录，并打包成 zip
+    3. 按结果表名（000004 / 000006）拆分，分别写入各 segment 的数据目录，并打包成 zip
     4. 生成一个统一的 HTML 看板，用顶部客群按钮切换老客/新客（数据内嵌，离线可开）
 """
 
@@ -87,14 +88,14 @@ SEGMENTS = {
     "new": {
         "title": "Fundo 新客模型监控",
         "name": "新客",
-        "sql_file": PROJECT_DIR / "fundo_model_monitor_000006.sql",
+        "sql_file": PROJECT_DIR / "fundo_model_monitor.sql",
         "data_dir": PROJECT_DIR / "原始数据_新客",
         "zip_file": PROJECT_DIR / "model_monitor_data_new.zip",
         "labels": LABELS,
         "models": [
             ("aus_new_risk_bid_3rdmodel_v1_0_20251201", "3rdmodel 新客主模型", "", []),
         ],
-        "meta_hint": "周 = 放款周（dispersal_week，图中显示为该周周一日期），1 行/申请",
+        "meta_hint": "周 = 放款周（dispersal_week，图中显示为该周周一日期），每申请取最新一行",
         "bin_hint": "等频箱 1-5（源表 _bin 五档）",
         "note": "模型说明：新客 3rdmodel v1.0（aus_new_risk_bid_3rdmodel_v1_0_20251201）；分箱为源表 _bin 的等频五档。"
                 "口径说明：新老客按 ba.customer_profile_rawdata.user_tag = 'New' 区分；"
@@ -105,6 +106,8 @@ SEGMENTS = {
 
 SEGMENT_KEY = "existing"
 SEGMENT = SEGMENTS[SEGMENT_KEY]
+# 合并 SQL 后，用目标表名中的模型编号区分两个客群
+SEGMENT_TOKENS = {"existing": "000004", "new": "000006"}
 
 
 def configure_segment(key):
@@ -165,11 +168,16 @@ def first_line(sql, width=90):
     return line[:width] + ("…" if len(line) > width else "")
 
 
-def run_sql_file(query_fn):
-    """按顺序执行 SQL 文件中的语句，返回 [(表名或 None, DataFrame), ...]。"""
+def run_sql_file(query_fn, token=None):
+    """按顺序执行 SQL 文件中的语句，返回 [(表名或 None, DataFrame), ...]。
+
+    token 为空时执行整个文件；否则只执行包含该编号的语句（000004 / 000006）。
+    """
     statements = split_statements(SQL_FILE.read_text(encoding="utf-8"))
+    if token:
+        statements = [statement for statement in statements if token in statement]
     if not statements:
-        raise ValueError(f"{SQL_FILE.name} 中没有可执行语句")
+        raise ValueError(f"{SQL_FILE.name} 中没有可执行语句（token={token}）")
 
     targets = []
     results = []
@@ -200,6 +208,19 @@ def pick_result(results, keyword, fallback_index):
     if len(results) > fallback_index:
         return results[fallback_index][1], results[fallback_index][0]
     return None, None
+
+
+def split_results_by_segment(results):
+    """按结果表名中的 000004 / 000006 把查询结果分给两个客群。"""
+    grouped = {key: [] for key in SEGMENT_TOKENS}
+    for name, frame in results:
+        if not name:
+            continue
+        for key, token in SEGMENT_TOKENS.items():
+            if token in name:
+                grouped[key].append((name, frame))
+                break
+    return grouped
 
 
 def load_result(path):
@@ -538,15 +559,23 @@ def main(argv=None):
             return 2
 
         keys = ("existing", "new") if args.segment == "both" else (args.segment,)
+        configure_segment(keys[0])
+        print(f"\n===== 执行 {SQL_FILE.name} =====")
+        results = run_sql_file(
+            query_to_df,
+            None if len(keys) == 2 else SEGMENT_TOKENS[keys[0]],
+        )
+        results_by_segment = split_results_by_segment(results)
+
         for key in keys:
             configure_segment(key)
             print(f"\n===== {SEGMENT['title']} =====")
-            results = run_sql_file(query_to_df)
-            df, source_table = pick_result(results, "auc", 0)
-            funnel_df, _ = pick_result(results, "funnel", 1)
-            bin_df, _ = pick_result(results, "bin", 2)
-            dist_df, _ = pick_result(results, "dist", 3)
-            binf_df, _ = pick_result(results, "bin_funnel", 4)
+            segment_results = results_by_segment.get(key, [])
+            df, source_table = pick_result(segment_results, "auc", 0)
+            funnel_df, _ = pick_result(segment_results, "funnel", 1)
+            bin_df, _ = pick_result(segment_results, "bin", 2)
+            dist_df, _ = pick_result(segment_results, "dist", 3)
+            binf_df, _ = pick_result(segment_results, "bin_funnel", 4)
 
             if df is None or len(df) == 0:
                 print("警告 | AUC 查询结果为空，看板将显示空状态")
