@@ -1,16 +1,16 @@
-"""同步老客模型周度 AUC、转化率与分箱坏账率，并生成自包含的 HTML 监控看板。
+"""同步模型周度 AUC、转化率与分箱坏账率，并生成自包含的 HTML 监控看板。
 
 用法（线上环境，脚本同目录需有提供 query_to_df(sql) 的 hive_config）：
-    python monitor.py
+    python monitor.py                 # 老客 00004 + 新客 00006，生成同一个看板
+    python monitor.py --segment existing   # 只跑老客 00004
+    python monitor.py --segment new        # 只跑新客 00006
     python monitor.py --from-csv 原始数据/model_monitor_auc.csv   # 不连库，用已导出的结果重建看板
 
 流程：
-    1. 读取 fundo_model_monitor.sql，按分号拆成语句依次执行（DROP / CREATE / 可选 SELECT）
+    1. 依次读取各 segment 的 SQL 文件，按分号拆成语句执行（DROP / CREATE / 可选 SELECT）
     2. 没有 SELECT 语句时，自动 SELECT * FROM CREATE 出来的每张表
-    3. 结果分别写入 原始数据/ 下的 model_monitor_auc.csv、model_monitor_funnel.csv、
-       model_monitor_bin.csv、model_monitor_score_dist.csv、model_monitor_bin_funnel.csv，
-       并一起打包成 model_monitor_data.zip
-    4. 生成根目录下的 model_monitor_dashboard.html（数据内嵌，离线可开）
+    3. 结果分别写入各 segment 的数据目录，并打包成 zip
+    4. 生成一个统一的 HTML 看板，用顶部客群按钮切换老客/新客（数据内嵌，离线可开）
 """
 
 import argparse
@@ -67,6 +67,66 @@ MODELS = [
     ("aus_old_risk_apply_appmodel_v20260318_v1_2_lgb_score", "appmodel 行为子模型", "1.2",
      [0.051725, 0.069226, 0.090624, 0.1212]),
 ]
+
+SEGMENTS = {
+    "existing": {
+        "title": "Fundo 老客模型监控",
+        "name": "老客",
+        "sql_file": PROJECT_DIR / "fundo_model_monitor.sql",
+        "data_dir": PROJECT_DIR / "原始数据",
+        "zip_file": PROJECT_DIR / "model_monitor_data.zip",
+        "labels": LABELS,
+        "models": MODELS,
+        "meta_hint": "周 = 放款周（dispersal_week，图中显示为该周周一日期），每申请取最新一次 run",
+        "bin_hint": "行为箱 1-5",
+        "note": "模型说明：mltmodel = 融合主模型，submodel = 银行流水子模型，appmodel = 行为子模型。"
+                "口径说明：标签取自 ba.customer_profile_rawdata（FPD7）与 model.tmp_eliam_listing_vintage（首期/2 期/3 期），"
+                "未放款申请不参与 AUC；最近一周的 FPD7、近 1-3 个月的 30+ 标签尚未成熟，样本量会明显偏低属正常现象。"
+                "v1.2 于 2026-09-23 上线，此前周的 v1.2 分为离线回填（回测口径）；submodel v1.2 在 2026Q1 前覆盖约 68%-81%。",
+    },
+    "new": {
+        "title": "Fundo 新客模型监控",
+        "name": "新客",
+        "sql_file": PROJECT_DIR / "fundo_model_monitor_000006.sql",
+        "data_dir": PROJECT_DIR / "原始数据_新客",
+        "zip_file": PROJECT_DIR / "model_monitor_data_new.zip",
+        "labels": LABELS,
+        "models": [
+            ("aus_new_risk_bid_3rdmodel_v1_0_20251201", "3rdmodel 新客主模型", "", []),
+        ],
+        "meta_hint": "周 = 放款周（dispersal_week，图中显示为该周周一日期），1 行/申请",
+        "bin_hint": "等频箱 1-5（源表 _bin 五档）",
+        "note": "模型说明：新客 3rdmodel v1.0（aus_new_risk_bid_3rdmodel_v1_0_20251201）；分箱为源表 _bin 的等频五档。"
+                "口径说明：新老客按 ba.customer_profile_rawdata.user_tag = 'New' 区分；"
+                "标签取自 model.tmp_eliam_risk_000006_vintage_monitor；"
+                "无效分（-1）不参与 AUC / 分箱统计，未放款申请不参与 AUC。",
+    },
+}
+
+SEGMENT_KEY = "existing"
+SEGMENT = SEGMENTS[SEGMENT_KEY]
+
+
+def configure_segment(key):
+    global SEGMENT_KEY, SEGMENT, LABELS, MODELS
+    global SQL_FILE, CSV_FILE, FUNNEL_CSV_FILE, BIN_CSV_FILE, DIST_CSV_FILE, BINF_CSV_FILE
+    global ZIP_FILE
+
+    segment = SEGMENTS[key]
+    SEGMENT_KEY = key
+    SEGMENT = segment
+    LABELS = segment["labels"]
+    MODELS = segment["models"]
+    SQL_FILE = segment["sql_file"]
+
+    data_dir = segment["data_dir"]
+    CSV_FILE = data_dir / "model_monitor_auc.csv"
+    FUNNEL_CSV_FILE = data_dir / "model_monitor_funnel.csv"
+    BIN_CSV_FILE = data_dir / "model_monitor_bin.csv"
+    DIST_CSV_FILE = data_dir / "model_monitor_score_dist.csv"
+    BINF_CSV_FILE = data_dir / "model_monitor_bin_funnel.csv"
+    ZIP_FILE = segment["zip_file"]
+
 
 _UNFUNDED = "UNFUNDED"
 # 已表现样本量低于历史常规水平的这个比例时，视为「样本未成熟」
@@ -372,101 +432,144 @@ def build_binf_payload(df):
     }
 
 
-def build_html(payload, source_name):
-    payload = {**payload, "source": source_name or ""}
-    data = json.dumps(payload, ensure_ascii=False)
+def build_dataset(df, funnel_df, bin_df, dist_df, binf_df, source_name):
+    payload = build_payload(df)
+    payload["funnel"] = build_funnel_payload(funnel_df)
+    payload["bins"] = build_bin_payload(bin_df)
+    payload["dist"] = build_dist_payload(dist_df)
+    payload["binfunnel"] = build_binf_payload(binf_df)
+    payload["source"] = source_name or ""
+    payload["segment"] = {
+        "key": SEGMENT_KEY,
+        "name": SEGMENT["name"],
+        "title": SEGMENT["title"],
+        "binHint": SEGMENT["bin_hint"],
+        "metaHint": SEGMENT["meta_hint"],
+        "note": SEGMENT["note"],
+    }
+    return payload
+
+
+def build_html(datasets):
+    data = json.dumps(datasets, ensure_ascii=False)
     return HTML_TEMPLATE.replace("__DATA_JSON__", data)
 
 
+def save_dataset_csvs(df, funnel_df, bin_df, dist_df, binf_df):
+    CSV_FILE.parent.mkdir(parents=True, exist_ok=True)
+    written = []
+    for path, frame, label in (
+        (CSV_FILE, df, "结果"),
+        (FUNNEL_CSV_FILE, funnel_df, "转化"),
+        (BIN_CSV_FILE, bin_df, "分箱"),
+        (DIST_CSV_FILE, dist_df, "分布"),
+        (BINF_CSV_FILE, binf_df, "分箱转化"),
+    ):
+        if frame is None:
+            continue
+        frame.to_csv(path, index=False, encoding="utf-8-sig")
+        written.append(path)
+        print(f"已保存{label} | {path}（{len(frame)} 行）")
+    if written:
+        write_zip(written)
+        print(f"已打包 | {ZIP_FILE}")
+
+
+def load_dataset(auc_path, funnel_csv=None, bin_csv=None, dist_csv=None, binf_csv=None):
+    auc_path = Path(auc_path)
+    df = load_result(auc_path)
+    base_dir = auc_path.parent
+
+    def sibling(explicit, default_name, label):
+        path = Path(explicit) if explicit else base_dir / default_name
+        if not path.exists():
+            print(f"未找到{label} | {path}（对应区块将不显示）")
+            return None
+        return load_result(path)
+
+    return build_dataset(
+        df,
+        sibling(funnel_csv, FUNNEL_CSV_FILE.name, "转化数据"),
+        sibling(bin_csv, BIN_CSV_FILE.name, "分箱数据"),
+        sibling(dist_csv, DIST_CSV_FILE.name, "分布数据"),
+        sibling(binf_csv, BINF_CSV_FILE.name, "分箱转化数据"),
+        None,
+    )
+
+
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="同步模型周度 AUC / 转化率 / 分箱坏账率并生成 HTML 看板")
-    parser.add_argument("--from-csv", help="不连库，直接用已导出的 AUC 结果 CSV 生成看板")
+    parser = argparse.ArgumentParser(description="同步老客/新客模型周度 AUC、转化率与分箱坏账率并生成统一看板")
+    parser.add_argument("--segment", choices=("both", "existing", "new"), default="both",
+                        help="执行范围：both = 老客 + 新客（默认），existing = 仅老客，new = 仅新客")
+    parser.add_argument("--from-csv", help="不连库，用已导出的老客 AUC 结果 CSV 生成看板")
+    parser.add_argument("--new-from-csv", help="不连库，用已导出的新客 AUC 结果 CSV 生成看板")
     parser.add_argument("--funnel-csv", help="配合 --from-csv 的转化率结果 CSV；默认取同目录 model_monitor_funnel.csv")
     parser.add_argument("--bin-csv", help="配合 --from-csv 的分箱结果 CSV；默认取同目录 model_monitor_bin.csv")
     parser.add_argument("--dist-csv", help="配合 --from-csv 的分布结果 CSV；默认取同目录 model_monitor_score_dist.csv")
     parser.add_argument("--bin-funnel-csv", help="配合 --from-csv 的分箱转化结果 CSV；默认取同目录 model_monitor_bin_funnel.csv")
     args = parser.parse_args(argv)
 
-    source_table = None
-    if args.from_csv:
-        df = load_result(Path(args.from_csv))
-        base_dir = Path(args.from_csv).parent
-        funnel_path = Path(args.funnel_csv) if args.funnel_csv else base_dir / FUNNEL_CSV_FILE.name
-        bin_path = Path(args.bin_csv) if args.bin_csv else base_dir / BIN_CSV_FILE.name
-        dist_path = Path(args.dist_csv) if args.dist_csv else base_dir / DIST_CSV_FILE.name
-        binf_path = Path(args.bin_funnel_csv) if args.bin_funnel_csv else base_dir / BINF_CSV_FILE.name
-        funnel_df = load_result(funnel_path) if funnel_path.exists() else None
-        if funnel_df is None:
-            print(f"未找到转化数据 | {funnel_path}（看板将不显示转化区块）")
-        bin_df = load_result(bin_path) if bin_path.exists() else None
-        if bin_df is None:
-            print(f"未找到分箱数据 | {bin_path}（看板将不显示分箱区块）")
-        dist_df = load_result(dist_path) if dist_path.exists() else None
-        if dist_df is None:
-            print(f"未找到分布数据 | {dist_path}（看板将不显示分布区块）")
-        binf_df = load_result(binf_path) if binf_path.exists() else None
-        if binf_df is None:
-            print(f"未找到分箱转化数据 | {binf_path}（看板将不显示分箱转化区块）")
+    datasets = {}
+    csv_mode = bool(args.from_csv or args.new_from_csv)
+
+    if csv_mode:
+        if args.segment in ("both", "existing"):
+            if not args.from_csv:
+                parser.error("--segment existing/both 需要 --from-csv")
+            configure_segment("existing")
+            datasets["existing"] = load_dataset(
+                args.from_csv, args.funnel_csv, args.bin_csv, args.dist_csv, args.bin_funnel_csv
+            )
+        if args.segment in ("both", "new"):
+            new_path = (Path(args.new_from_csv) if args.new_from_csv
+                        else SEGMENTS["new"]["data_dir"] / "model_monitor_auc.csv")
+            if new_path.exists():
+                configure_segment("new")
+                datasets["new"] = load_dataset(new_path)
+            elif args.segment == "new":
+                parser.error(f"未找到新客结果：{new_path}")
+            else:
+                print(f"未找到新客结果 | {new_path}，本次只生成老客看板")
     else:
         try:
             from hive_config import query_to_df
         except ImportError:
             print("未找到 hive_config.py：请把提供 query_to_df(sql) 的模块放到本脚本同目录或 PYTHONPATH 中。")
             return 2
-        results = run_sql_file(query_to_df)
-        df, source_table = pick_result(results, "auc", 0)
-        funnel_df, _ = pick_result(results, "funnel", 1)
-        bin_df, _ = pick_result(results, "bin", 2)
-        dist_df, _ = pick_result(results, "dist", 3)
-        binf_df, _ = pick_result(results, "bin_funnel", 4)
 
-    if df is None or len(df) == 0:
-        print("警告 | AUC 查询结果为空，看板将显示空状态")
+        keys = ("existing", "new") if args.segment == "both" else (args.segment,)
+        for key in keys:
+            configure_segment(key)
+            print(f"\n===== {SEGMENT['title']} =====")
+            results = run_sql_file(query_to_df)
+            df, source_table = pick_result(results, "auc", 0)
+            funnel_df, _ = pick_result(results, "funnel", 1)
+            bin_df, _ = pick_result(results, "bin", 2)
+            dist_df, _ = pick_result(results, "dist", 3)
+            binf_df, _ = pick_result(results, "bin_funnel", 4)
 
-    if not args.from_csv:
-        CSV_FILE.parent.mkdir(parents=True, exist_ok=True)
-        written = []
-        if df is not None:
-            df.to_csv(CSV_FILE, index=False, encoding="utf-8-sig")
-            written.append(CSV_FILE)
-            print(f"已保存结果 | {CSV_FILE}（{len(df)} 行）")
-        if funnel_df is not None:
-            funnel_df.to_csv(FUNNEL_CSV_FILE, index=False, encoding="utf-8-sig")
-            written.append(FUNNEL_CSV_FILE)
-            print(f"已保存转化 | {FUNNEL_CSV_FILE}（{len(funnel_df)} 行）")
-        if bin_df is not None:
-            bin_df.to_csv(BIN_CSV_FILE, index=False, encoding="utf-8-sig")
-            written.append(BIN_CSV_FILE)
-            print(f"已保存分箱 | {BIN_CSV_FILE}（{len(bin_df)} 行）")
-        if dist_df is not None:
-            dist_df.to_csv(DIST_CSV_FILE, index=False, encoding="utf-8-sig")
-            written.append(DIST_CSV_FILE)
-            print(f"已保存分布 | {DIST_CSV_FILE}（{len(dist_df)} 行）")
-        if binf_df is not None:
-            binf_df.to_csv(BINF_CSV_FILE, index=False, encoding="utf-8-sig")
-            written.append(BINF_CSV_FILE)
-            print(f"已保存分箱转化 | {BINF_CSV_FILE}（{len(binf_df)} 行）")
-        if written:
-            write_zip(written)
-            print(f"已打包 | {ZIP_FILE}")
+            if df is None or len(df) == 0:
+                print("警告 | AUC 查询结果为空，看板将显示空状态")
+            save_dataset_csvs(df, funnel_df, bin_df, dist_df, binf_df)
+            datasets[key] = build_dataset(df, funnel_df, bin_df, dist_df, binf_df, source_table)
 
-    payload = build_payload(df)
-    payload["funnel"] = build_funnel_payload(funnel_df)
-    payload["bins"] = build_bin_payload(bin_df)
-    payload["dist"] = build_dist_payload(dist_df)
-    payload["binfunnel"] = build_binf_payload(binf_df)
+    if not datasets:
+        print("没有可用的数据，未生成看板")
+        return 1
+
     HTML_FILE.parent.mkdir(parents=True, exist_ok=True)
-    HTML_FILE.write_text(build_html(payload, source_table), encoding="utf-8")
-    print(f"已生成看板 | {HTML_FILE}")
-    print(f"周数 {len(payload['weeks'])} | 标签 {len(payload['labels'])} | 模型 {len(payload['models'])}")
-    if payload["funnel"]:
-        print(f"转化周数 {len(payload['funnel']['weeks'])}")
-    if payload["bins"]:
-        print(f"分箱周数 {len(payload['bins']['weeks'])}")
-    if payload["dist"]:
-        print(f"分布周数 {len(payload['dist']['weeks'])}")
-    if payload["binfunnel"]:
-        print(f"分箱转化周数 {len(payload['binfunnel']['weeks'])}")
+    HTML_FILE.write_text(build_html(datasets), encoding="utf-8")
+    print(f"\n已生成看板 | {HTML_FILE}")
+    for key, payload in datasets.items():
+        print(f"[{key}] 周数 {len(payload['weeks'])} | 标签 {len(payload['labels'])} | 模型 {len(payload['models'])}")
+        if payload["funnel"]:
+            print(f"[{key}] 转化周数 {len(payload['funnel']['weeks'])}")
+        if payload["bins"]:
+            print(f"[{key}] 分箱周数 {len(payload['bins']['weeks'])}")
+        if payload["dist"]:
+            print(f"[{key}] 分布周数 {len(payload['dist']['weeks'])}")
+        if payload["binfunnel"]:
+            print(f"[{key}] 分箱转化周数 {len(payload['binfunnel']['weeks'])}")
     return 0
 
 
@@ -475,7 +578,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Fundo 老客模型监控</title>
+<title>Fundo 模型监控</title>
 <style>
   :root {
     color-scheme: light;
@@ -635,15 +738,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <body>
 <div class="wrap">
   <header>
-    <h1>Fundo 老客模型监控</h1>
+    <h1>Fundo 模型监控</h1>
     <div class="meta">
       <span id="meta-source"></span>
       <span id="meta-generated"></span>
-      <span>周 = 放款周（dispersal_week，图中显示为该周周一日期），每申请取最新一次 run</span>
+      <span id="meta-hint"></span>
     </div>
   </header>
 
   <div class="filters" role="toolbar" aria-label="筛选">
+    <div class="pills" id="segment-pills" role="group" aria-label="客群"></div>
     <div class="pills" id="label-pills" role="group" aria-label="标签"></div>
     <div class="pills" id="version-pills" role="group" aria-label="版本"></div>
     <label class="control">分箱模型
@@ -690,7 +794,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   <section class="card" id="funnel-card" hidden>
     <div class="card-head">
-      <h2>转化率（按申请周 · 老客）</h2>
+      <h2 id="funnel-title">转化率（按申请周）</h2>
       <span class="hint">完成率 = 完成/申请；通过率 = 通过/完成；成交率 = 成交/通过；成交 = Active_Account / Closed / Blocked</span>
     </div>
     <div class="legend" id="funnel-legend"></div>
@@ -749,7 +853,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   <section class="card" id="binf-card" hidden>
     <div class="card-head">
-      <h2>分箱转化率（按申请周 · 老客）</h2>
+      <h2 id="binf-title">分箱转化率（按申请周）</h2>
       <span class="hint">通过率 = 通过/完成；成交率 = 成交/通过；箱 1 最浅 → 箱 5 最深</span>
     </div>
     <div class="legend" id="binf-legend"></div>
@@ -773,21 +877,25 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </details>
   </section>
 
-  <p class="note">
-    模型说明：mltmodel = 融合主模型，submodel = 银行流水子模型，appmodel = 行为子模型。
-    口径说明：标签取自 ba.customer_profile_rawdata（FPD7）与 model.tmp_eliam_listing_vintage（首期/2 期/3 期），
-    未放款申请不参与 AUC；最近一周的 FPD7、近 1-3 个月的 30+ 标签尚未成熟，样本量会明显偏低属正常现象。
-    v1.2 于 2026-09-23 上线，此前周的 v1.2 分为离线回填（回测口径）；submodel v1.2 在 2026Q1 前覆盖约 68%-81%。
-  </p>
+  <p class="note" id="page-note"></p>
 </div>
 
 <div id="tooltip" role="status"></div>
 
 <script>
-const DATA = __DATA_JSON__;
+const DATASETS = __DATA_JSON__;
+const SEGMENT_KEYS = Object.keys(DATASETS);
+const state = {
+  segment: SEGMENT_KEYS[0],
+  label: DATASETS[SEGMENT_KEYS[0]].labels.length ? DATASETS[SEGMENT_KEYS[0]].labels[0].key : null,
+  range: '26',
+  version: 'compare',
+  binModel: null,
+};
+let DATA = DATASETS[state.segment];
+let SEGMENT = DATA.segment;
 
 const NS = 'http://www.w3.org/2000/svg';
-const state = { label: DATA.labels.length ? DATA.labels[0].key : null, range: '26', version: 'compare', binModel: null };
 const SVG_W = 960;
 const AUC_H = 350;
 const COUNT_H = 210;
@@ -858,6 +966,35 @@ function visibleModels() {
   return all.filter((model) => model.version === state.version || model.version === '');
 }
 
+function renderSegmentPills() {
+  const box = $('#segment-pills');
+  box.textContent = '';
+  box.hidden = SEGMENT_KEYS.length <= 1;
+  if (SEGMENT_KEYS.length <= 1) return;
+  SEGMENT_KEYS.forEach((key) => {
+    const b = document.createElement('button');
+    b.className = 'pill';
+    b.textContent = DATASETS[key].segment.name;
+    b.setAttribute('aria-pressed', String(state.segment === key));
+    b.addEventListener('click', () => switchSegment(key));
+    box.appendChild(b);
+  });
+}
+
+function switchSegment(key) {
+  if (key === state.segment) return;
+  state.segment = key;
+  DATA = DATASETS[key];
+  SEGMENT = DATA.segment;
+  state.label = DATA.labels.length ? DATA.labels[0].key : null;
+  state.version = 'compare';
+  state.binModel = null;
+  renderSegmentPills();
+  renderPills();
+  renderVersionPills();
+  renderAll();
+}
+
 function renderPills() {
   const box = $('#label-pills');
   box.textContent = '';
@@ -880,6 +1017,9 @@ const VERSION_VIEWS = [['1.1', '1.1'], ['1.2', '1.2'], ['compare', '对比']];
 function renderVersionPills() {
   const box = $('#version-pills');
   box.textContent = '';
+  const hasVersions = DATA.models.some((model) => model.version);
+  box.hidden = !hasVersions;
+  if (!hasVersions) return;
   VERSION_VIEWS.forEach(([key, name]) => {
     const b = document.createElement('button');
     b.className = 'pill';
@@ -1722,6 +1862,8 @@ function binModelsForVersion() {
 function renderBinModelOptions() {
   const select = $('#bin-model-select');
   const models = binModelsForVersion();
+  const control = select.closest('label');
+  if (control) control.hidden = models.length <= 1;
   select.textContent = '';
   models.forEach((model) => {
     const option = document.createElement('option');
@@ -1750,7 +1892,7 @@ function renderBins() {
   const limits = ((DATA.bins.thresholds) || {})[state.binModel];
   $('#bin-hint').textContent = (limits && limits.length === 4
     ? '箱 1-4 上限：' + limits.map((value) => value.toFixed(4)).join(' / ') + '；箱 5 为以上。'
-    : '') + '行为箱 1-5，列为周（左旧右新）；颜色越深坏账率越高';
+    : '') + (SEGMENT.binHint || '行为箱 1-5') + '，列为周（左旧右新）；颜色越深坏账率越高';
   renderBinHeatmap('fpd7_flag', 'fpd7');
   renderBinHeatmap('duedate_1m_30', '1m30');
 }
@@ -1836,10 +1978,10 @@ function renderBinHeatmap(label, suffix) {
   const height = plot.top + 5 * cellH + 30;
   svg.setAttribute('viewBox', `0 0 ${SVG_W} ${height}`);
 
-  // 热力图统一用浅色底版，保证「风险越高颜色越深」在明暗主题下都成立
+  // 底版跟随主题，避免深色模式下出现浅色色块
   svgEl('rect', {
     x: plot.left, y: plot.top, width: plot.width, height: 5 * cellH,
-    fill: '#fcfcfb', rx: 3,
+    fill: cssVar('--surface'), rx: 3,
   }, svg);
 
   const xOf = (i) => plot.left + (i + 0.5) * cellW;
@@ -2058,7 +2200,7 @@ function renderDistChart() {
 
   svgEl('rect', {
     x: plot.left, y: plot.top, width: plot.width, height: plot.height,
-    fill: '#fcfcfb', rx: 3,
+    fill: cssVar('--surface'), rx: 3,
   }, svg);
 
   const band = plot.width / weeks.length;
@@ -2066,7 +2208,7 @@ function renderDistChart() {
   const xOf = (i) => plot.left + (i + 0.5) * band;
 
   const ticks = [0, 0.25, 0.5, 0.75, 1].map((v) => ({ value: v }));
-  drawYAxis(svg, plot, ticks, (v) => Math.round(v * 100) + '%', { grid: '#e1e0d9', axis: '#c3c2b7' });
+  drawYAxis(svg, plot, ticks, (v) => Math.round(v * 100) + '%');
   drawXAxis(svg, plot, weeks, xOf, DIST_H);
 
   weeks.forEach((week, i) => {
@@ -2263,7 +2405,7 @@ function renderBinFunnelChart(metric) {
   plot.y = (v) => plot.top + (1 - v) * plot.height;
   svg.setAttribute('viewBox', `0 0 ${SVG_W} ${BF_H}`);
 
-  const plate = '#fcfcfb';
+  const plate = cssVar('--surface');
   svgEl('rect', {
     x: plot.left, y: plot.top, width: plot.width, height: plot.height,
     fill: plate, rx: 3,
@@ -2271,7 +2413,7 @@ function renderBinFunnelChart(metric) {
 
   const xOf = (i) => plot.left + (i + 0.5) * plot.width / weeks.length;
   const ticks = [0, 0.25, 0.5, 0.75, 1].map((v) => ({ value: v }));
-  drawYAxis(svg, plot, ticks, (v) => Math.round(v * 100) + '%', { grid: '#e1e0d9', axis: '#c3c2b7' });
+  drawYAxis(svg, plot, ticks, (v) => Math.round(v * 100) + '%');
   drawXAxis(svg, plot, weeks, xOf, BF_H);
 
   series.forEach((item) => {
@@ -2300,7 +2442,7 @@ function renderBinFunnelChart(metric) {
   });
 
   const crosshair = svgEl('line', {
-    y1: plot.top, y2: plot.top + plot.height, stroke: '#c3c2b7',
+    y1: plot.top, y2: plot.top + plot.height, stroke: cssVar('--axis'),
     'stroke-width': 1, visibility: 'hidden',
   }, svg);
 
@@ -2379,7 +2521,16 @@ function renderBinFunnelTable(metric, weeks, model) {
   box.appendChild(table);
 }
 
+function renderPageChrome() {
+  document.title = DATA.segment.title || 'Fundo 模型监控';
+  $('#meta-hint').textContent = DATA.segment.metaHint || '';
+  $('#funnel-title').textContent = '转化率（按申请周 · ' + DATA.segment.name + '）';
+  $('#binf-title').textContent = '分箱转化率（按申请周 · ' + DATA.segment.name + '）';
+  $('#page-note').textContent = DATA.segment.note || '';
+}
+
 function renderAll() {
+  renderPageChrome();
   $('#meta-source').textContent = DATA.source ? '数据表 ' + DATA.source : '';
   $('#meta-generated').textContent = '生成于 ' + DATA.generatedAt;
   const weeks = visibleWeeks();
@@ -2407,6 +2558,7 @@ $('#bin-model-select').addEventListener('change', (event) => {
   renderBinFunnel();
 });
 
+renderSegmentPills();
 renderPills();
 renderVersionPills();
 renderAll();

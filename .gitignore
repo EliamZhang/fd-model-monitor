@@ -4,7 +4,9 @@
 
 # sync.py / monitor.py 运行时产物
 原始数据/
+原始数据_新客/
 model_monitor_data.zip
+model_monitor_data_new.zip
 model_monitor_dashboard.html
 
 # 本机数据库连接配置
